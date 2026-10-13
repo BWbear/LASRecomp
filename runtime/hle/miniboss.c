@@ -26,7 +26,7 @@ uint64_t doorjump_player(uint64_t frame);  // PlayerCollision component: positio
 // loaded, wherever Link is (an idle Master Stalfos is invisible), start (main offset, 0: none) - its own start action,
 // called with the actor instead of the state change (Lanmola: what his screen's event runs - up out of the sand),
 // arm (bosses): instead, the start of its dungeon room - the zone manager's room-entry call (f_7000029520) once it's
-// there; Link walking into its AreaEventBox then starts its fight
+// there; Link walking into its AreaEventBox then starts its fight - or, with chg, straight into its fight state
 typedef struct {
     uint64_t vt, chg; uint32_t sm, pos; uint8_t idle, fight; const char *name; uint8_t rest, then, at_once; uint32_t start; uint8_t arm;
 } Kind;
@@ -44,7 +44,8 @@ static const Kind g_kinds[] = {
     // 0x59: 12 = hidden until his room's event (AreaEventBox - not copied: intro, music) drops him in; 13 shows him
     {MAIN_BASE + 0x1b8ea08, MAIN_BASE + 0x4b9be0, 0x1230, 0x260, 12, 13, "Master Stalfos", 0xff, 1, 1},
     // bosses (enemy randomizer "Include bosses"): started by their own event (arm)
-    {MAIN_BASE + 0x1b71f38, 0, 0xff0, 0x260, 0, 0, "Moldorm", 0xff, 0, 0, 0, 1},     // 0x63
+    {MAIN_BASE + 0x1b71f38, MAIN_BASE + 0x2a0840, 0xff0, 0x260, 6, 1, "Moldorm", 0xff, 0, 0, 0, 1},  // 0x63: 6 = waits for
+    // its start box (armed), 1 starts it (-> 2 -> 0, crawling); 17 = paused while Link is screens away
     {MAIN_BASE + 0x1b9fe60, 0, 0x1340, 0x260, 0, 0, "Genie", 0xff, 0, 0, 0, 1},      // 0x64
     {MAIN_BASE + 0x1b91228, 0, 0xff0, 0x260, 0, 0, "Facade", 0xff, 0, 0, 0, 1},      // 0x68
     {MAIN_BASE + 0x1b70940, 0, 0xff0, 0x260, 0, 0, "Hot Head", 0xff, 0, 0, 0, 1},    // 0x6a
@@ -367,6 +368,38 @@ static void cueball_tick(Cpu *c, Seen *s, const Kind *k, uint64_t frame) {
     if (ENV("LARECOMP_LOG_ROAM")) LOG("[roam] Cue Ball at %.1f %.1f turns back\n", p[0], p[2]);
 }
 
+// Moldorm on the Field crawls at its own height wherever its heading takes it (its arena is a flat floor in walls):
+// here a wall, water or the edge of its own screen just ahead (rando/<seed>/roam.tsv) turns it back - its heading
+// (+0x148c, angle units as Gohma's) mirrored off that side, as off its arena's walls.
+static bool blocked_at(float x, float z, float sx0, float sz0) {  // (its screen: x sx0 .. +15, z sz0 .. +12)
+    if (x < sx0 + 0.5f || x > sx0 + 14.5f || z < sz0 + 0.5f || z > sz0 + 11.5f) return true;
+    if (g_nwalls < 0) walls_load();
+    for (int i = 0; i < g_nwalls; i++) {
+        const WallScreen *r = &g_walls[i];
+        int cx = (int)floorf((x - r->x0) / r->ts), cz = (int)floorf((z - r->z0) / r->ts);
+        if (cx >= 0 && cx < r->w && cz >= 0 && cz < r->h) return r->cells[cz * r->w + cx] != '.';
+    }
+    return false;
+}
+
+#define MOLDORM_AHEAD 1.0f  // (its head's reach)
+static void moldorm_walls(Seen *s, const Kind *k, uint64_t frame) {
+    uint64_t comp = LD64(s->obj + 0x80);
+    if (!comp || frame < s->flip_at) return;
+    const float *p = (const float *)(uintptr_t)(comp + 0x80), *home = (const float *)(uintptr_t)(s->obj + k->pos);
+    float sx0 = floorf(home[0] / 15.0f) * 15.0f, sz0 = floorf(home[2] / 12.0f) * 12.0f;
+    int32_t *heading = (int32_t *)(uintptr_t)(s->obj + 0x148c);
+    float a = (float)*heading * (3.14159265f / 2147483648.0f), dx = sinf(a), dz = cosf(a);
+    if (!blocked_at(p[0] + dx * MOLDORM_AHEAD, p[2] + dz * MOLDORM_AHEAD, sx0, sz0)) return;
+    bool side_x = blocked_at(p[0] + dx * MOLDORM_AHEAD, p[2], sx0, sz0),  // (which way the wall is)
+         side_z = blocked_at(p[0], p[2] + dz * MOLDORM_AHEAD, sx0, sz0);
+    if (side_x || !side_z) dx = -dx;
+    if (side_z || !side_x) dz = -dz;
+    *heading = (int32_t)(atan2f(dx, dz) * (2147483648.0f / 3.14159265f));
+    s->flip_at = frame + 8;  // (a moment to turn away before the next check)
+    if (ENV("LARECOMP_LOG_ROAM")) LOG("[roam] Moldorm at %.1f %.1f turns back\n", p[0], p[2]);
+}
+
 // Blaino's knock-out (tools/patches.py CRASHOUT_SITE): on the Field Link just falls back down - no fade, no restart
 // warp (its start only exists in his ring).
 int rt_crashout_skip(void) { return rt_gohma_free(); }
@@ -383,14 +416,37 @@ void miniboss_tick(Cpu *c, uint64_t frame) {
     const float *lp = (const float *)(uintptr_t)(pc + 0x80);
     memcpy(g_link, lp, sizeof g_link), g_have_link = true;
     marker_set(0);
+    if (ENV("LARECOMP_LOG_MB_ST") && frame % 120 == 0)  // (RE: which are still updated)
+        for (int i = 0; i < 32; i++)
+            if (g_seen[i].obj)
+                LOG("[mb-seen] f%llu %s %llx last seen f%llu vt %s, st %u, flags +0x43 %02x\n", (unsigned long long)frame,
+                    g_kinds[g_seen[i].kind].name, (unsigned long long)g_seen[i].obj, (unsigned long long)g_seen[i].last,
+                    LD64(g_seen[i].obj) == g_kinds[g_seen[i].kind].vt ? "ok" : "gone",
+                    *(uint8_t *)(uintptr_t)(g_seen[i].obj + g_kinds[g_seen[i].kind].sm + 0xd), LD8(g_seen[i].obj + 0x43));
     for (int i = 0; i < 32; i++) {
         Seen *s = &g_seen[i];
         if (!s->obj || frame - s->last > 2 || LD64(s->obj) != g_kinds[s->kind].vt) continue;
         const Kind *k = &g_kinds[s->kind];
+        if (ENV("LARECOMP_LOG_MB_ST") && LD64(s->obj + 0x80)) {  // (RE: state changes against Link's distance)
+            static uint8_t last[32];
+            uint8_t st = *(uint8_t *)(uintptr_t)(s->obj + k->sm + 0xd);
+            const float *q = (const float *)(uintptr_t)(LD64(s->obj + 0x80) + 0x80);
+            if (st != last[i] || frame % 120 == 0)
+                LOG("[mb-st] f%llu %s %llx st %u at %.1f %.1f Link %.1f %.1f (%.1f away)\n", (unsigned long long)frame,
+                    k->name, (unsigned long long)s->obj, st, q[0], q[2], lp[0], lp[2],
+                    sqrtf((q[0] - lp[0]) * (q[0] - lp[0]) + (q[2] - lp[2]) * (q[2] - lp[2])));
+            last[i] = st;
+        }
         // (a boss is armed as soon as it exists - the game loads the next screen's enemies before Link walks onto it,
         // so he enters its screen-wide box after that and it starts at once; others wait half a second)
         if (!k->arm && frame - s->first < 30) continue;
         if (k->arm) {
+            if (s->woken && ENV("LARECOMP_LOG_MB_Y") && frame % 10 == 0 && LD64(s->obj + 0x80)) {  // (RE: its moves)
+                const float *q = (const float *)(uintptr_t)(LD64(s->obj + 0x80) + 0x80);
+                LOG("[mb-y] f%llu %s %llx st %u at %.2f %.2f %.2f\n", (unsigned long long)frame, k->name,
+                    (unsigned long long)s->obj, *(uint8_t *)(uintptr_t)(s->obj + k->sm + 0xd), q[0], q[1], q[2]);
+            }
+            if (s->woken && !strcmp(k->name, "Moldorm")) moldorm_walls(s, k, frame);
             if (s->woken) continue;
             s->woken = 1;
             uint64_t saved[31], sp = c->sp;
@@ -399,7 +455,15 @@ void miniboss_tick(Cpu *c, uint64_t frame) {
             guest_call(c, MAIN_BASE + 0x29520);  // (the zone manager's room-entry call: f_7000029520 -> vfunc +0x100)
             memcpy(c->x, saved, sizeof saved);
             c->sp = sp;
-            LOG("[miniboss] f%llu %s armed (its start event plays when Link enters its box)\n", (unsigned long long)frame, k->name);
+            if (k->chg) {  // (then straight into its fight - without waiting for Link to walk into its start box)
+                c->x[0] = s->obj + k->sm;
+                c->x[1] = k->fight;
+                guest_call(c, k->chg);
+                memcpy(c->x, saved, sizeof saved);
+                c->sp = sp;
+            }
+            LOG("[miniboss] f%llu %s armed%s\n", (unsigned long long)frame, k->name,
+                k->chg ? " and started" : " (its start event plays when Link enters its box)");
             marker_set(1);
             continue;
         }

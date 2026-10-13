@@ -31,7 +31,8 @@ ANY_TERRAIN_MINIBOSSES = {0x58}  # (also on water / shallow water / air / tree /
 # where it isn't cramped: at most NEEDS_ROOM[type] of the 5 x 5 tiles around it blocked (the screen's grid, original
 # room; bushes and trees count; near the screen's edge, the same share of the tiles on it). Typical spots have 5 - 8,
 # cramped ones 10 - 17.
-NEEDS_ROOM = {0x60: 8, 0x59: 8, 0x52: 6}  # (most blocked of 25: Avalaunch, Master Stalfos, Moblin Chief - he charges)
+NEEDS_ROOM = {0x60: 8, 0x59: 8, 0x52: 6, 0x63: 3}  # (most blocked of 25: Avalaunch, Master Stalfos, Moblin Chief - he
+#                                                    charges, Moldorm - he crawls all over)
 
 
 def roomy(room, act, most_blocked):
@@ -260,9 +261,12 @@ def shuffleEnemyActors(room_data, folder: str, file: str, enemy_ids: dict, enemy
                 new_enemy = mini
             elif (enemy_settings.get('bosses') and folder == 'Field' and enemy_type == 'land' and not room_has_miniboss
                     and (_ONLY_BOSS or random.random() < BOSS_CHANCE)):
-                mini = int(_ONLY_BOSS, 16) if _ONLY_BOSS else random.choice(sorted(FIELD_BOSSES))  # (one per room)
-                room_has_miniboss = True
-                new_enemy = mini
+                pick = int(_ONLY_BOSS, 16) if _ONLY_BOSS else random.choice(sorted(FIELD_BOSSES))  # (one per room)
+                if pick not in NEEDS_ROOM or not enemy_settings.get('arena') or \
+                        roomy(enemy_settings['arena'](file[:-4]), act, NEEDS_ROOM[pick]):
+                    mini = pick
+                    room_has_miniboss = True
+                    new_enemy = mini
 
             # keep shuffling each actor until it is a valid enemy
             while new_enemy in restr and mini is None:
