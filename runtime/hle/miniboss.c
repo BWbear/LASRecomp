@@ -24,9 +24,11 @@ uint64_t doorjump_player(uint64_t frame);  // PlayerCollision component: positio
 // that ends its fight in its own room (Blaino's knock-out): woken again like idle, then (0: none) - a state it goes
 // on to a few frames after waking (Master Stalfos: 13 shows him, 1 is his fight), at_once: woken as soon as he's
 // loaded, wherever Link is (an idle Master Stalfos is invisible), start (main offset, 0: none) - its own start action,
-// called with the actor instead of the state change (Lanmola: what his screen's event runs - up out of the sand)
+// called with the actor instead of the state change (Lanmola: what his screen's event runs - up out of the sand),
+// arm (bosses): instead, the start of its dungeon room - the zone manager's room-entry call (f_7000029520) once it's
+// there; Link walking into its AreaEventBox then starts its fight
 typedef struct {
-    uint64_t vt, chg; uint32_t sm, pos; uint8_t idle, fight; const char *name; uint8_t rest, then, at_once; uint32_t start;
+    uint64_t vt, chg; uint32_t sm, pos; uint8_t idle, fight; const char *name; uint8_t rest, then, at_once; uint32_t start; uint8_t arm;
 } Kind;
 static const Kind g_kinds[] = {
     {MAIN_BASE + 0x1b80e90, MAIN_BASE + 0x3bfc60, 0xff0, 0x260, 0, 1, "Hinox", 0xff},  // 0x53: 10 = request HinoxStart
@@ -41,6 +43,11 @@ static const Kind g_kinds[] = {
     {MAIN_BASE + 0x1b8bc08, MAIN_BASE + 0x47db50, 0xff0, 0x260, 0, 1, "Lanmola", 0, 0, 0, 0x487ce0},
     // 0x59: 12 = hidden until his room's event (AreaEventBox - not copied: intro, music) drops him in; 13 shows him
     {MAIN_BASE + 0x1b8ea08, MAIN_BASE + 0x4b9be0, 0x1230, 0x260, 12, 13, "Master Stalfos", 0xff, 1, 1},
+    // bosses (enemy randomizer "Include bosses"): started by their own event (arm)
+    {MAIN_BASE + 0x1b71f38, 0, 0xff0, 0x260, 0, 0, "Moldorm", 0xff, 0, 0, 0, 1},     // 0x63
+    {MAIN_BASE + 0x1b9fe60, 0, 0x1340, 0x260, 0, 0, "Genie", 0xff, 0, 0, 0, 1},      // 0x64
+    {MAIN_BASE + 0x1b91228, 0, 0xff0, 0x260, 0, 0, "Facade", 0xff, 0, 0, 0, 1},      // 0x68
+    {MAIN_BASE + 0x1b70940, 0, 0xff0, 0x260, 0, 0, "Hot Head", 0xff, 0, 0, 0, 1},    // 0x6a
 };
 #define NKINDS (int)(sizeof g_kinds / sizeof g_kinds[0])
 #define WAKE_DIST 7.0f  // (a Field screen is ~15 x 12 units)
@@ -193,13 +200,16 @@ static void force_tick(Cpu *c, uint64_t frame) {
 // A copy of a mini-boss whose flow gives a check (Lanmola, Armos Knight) skips the item when its switch 2 - the seed's
 // OverworldMinibossMarker flag (settings.json "miniboss-marker-flag", tools/rando/miniboss_guard.py) - is set: set
 // every frame on the Field (an Armos Knight copy fights on its own, nothing wakes it). The originals have no switch 2
-// set: they give it as before. Written through the flag object (main+0x1CC1388, its byte capacity +0x1CC1390): the
-// flag may be past the game's 2048 (runtime/hle/flags_ext.c).
-static int g_marker = -2;
-RT_ON_RESET(miniboss_marker_reset) { g_marker = -2; }
-static void miniboss_marker_set(void) {
-    if (g_marker == -2) {
-        g_marker = -1;
+// set: they give it as before. An overworld boss's end event skips its dungeon's boss item the same way: its switch 2
+// is the seed's OverworldBossMarker flag ("boss-marker-flag", tools/rando/boss_guard.py), set whenever one is armed.
+// Written through the flag object (main+0x1CC1388, its byte capacity +0x1CC1390): the flag may be past the game's
+// 2048 (runtime/hle/flags_ext.c).
+static int g_markers[2] = {-2, -2};  // (mini-boss, boss)
+RT_ON_RESET(miniboss_marker_reset) { g_markers[0] = g_markers[1] = -2; }
+static void marker_set(int boss) {
+    int *g = &g_markers[boss];
+    if (*g == -2) {
+        *g = -1;
         extern const char *rando_seed_dir(void);
         const char *dir = rando_seed_dir();
         char p[512];
@@ -209,10 +219,11 @@ static void miniboss_marker_set(void) {
             size_t n = fread(buf, 1, sizeof buf - 1, f);
             buf[n] = 0;
             fclose(f);
-            const char *k = strstr(buf, "\"miniboss-marker-flag\":");
-            if (k) g_marker = atoi(k + strlen("\"miniboss-marker-flag\":"));
+            const char *key = boss ? "\"boss-marker-flag\":" : "\"miniboss-marker-flag\":", *k = strstr(buf, key);
+            if (k) *g = atoi(k + strlen(key));
         }
     }
+    int g_marker = *g;
     if (g_marker < 0) return;
     uint8_t *fl = (uint8_t *)(uintptr_t)LD64(MAIN_BASE + 0x1CC1388);
     if (!fl || (uint32_t)(g_marker >> 3) >= LD32(MAIN_BASE + 0x1CC1390)) return;
@@ -371,11 +382,27 @@ void miniboss_tick(Cpu *c, uint64_t frame) {
     if (!pc) return;
     const float *lp = (const float *)(uintptr_t)(pc + 0x80);
     memcpy(g_link, lp, sizeof g_link), g_have_link = true;
-    miniboss_marker_set();
+    marker_set(0);
     for (int i = 0; i < 32; i++) {
         Seen *s = &g_seen[i];
-        if (!s->obj || frame - s->last > 2 || frame - s->first < 30 || LD64(s->obj) != g_kinds[s->kind].vt) continue;
+        if (!s->obj || frame - s->last > 2 || LD64(s->obj) != g_kinds[s->kind].vt) continue;
         const Kind *k = &g_kinds[s->kind];
+        // (a boss is armed as soon as it exists - the game loads the next screen's enemies before Link walks onto it,
+        // so he enters its screen-wide box after that and it starts at once; others wait half a second)
+        if (!k->arm && frame - s->first < 30) continue;
+        if (k->arm) {
+            if (s->woken) continue;
+            s->woken = 1;
+            uint64_t saved[31], sp = c->sp;
+            memcpy(saved, c->x, sizeof saved);
+            c->x[0] = s->obj;
+            guest_call(c, MAIN_BASE + 0x29520);  // (the zone manager's room-entry call: f_7000029520 -> vfunc +0x100)
+            memcpy(c->x, saved, sizeof saved);
+            c->sp = sp;
+            LOG("[miniboss] f%llu %s armed (its start event plays when Link enters its box)\n", (unsigned long long)frame, k->name);
+            marker_set(1);
+            continue;
+        }
         if (!strcmp(k->name, "Gohma")) gohma_walls(s->obj);
         if (!strcmp(k->name, "Cue Ball")) cueball_tick(c, s, k, frame);
         if (!strcmp(k->name, "Avalaunch")) avalaunch_tick(c, s, k, frame);

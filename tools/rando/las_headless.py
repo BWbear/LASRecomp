@@ -96,7 +96,7 @@ def default_settings(seed):
         'boss-cutscenes': True, 'randomize-enemies': False, 'randomize-enemy-sizes': False, 'shuffle-dungeons': False,
         'blur-removal': False, 'OHKO': False, 'lv1-beam': False, 'nice-rod': True, 'nice-bombs': False,
         'stealing': 'always', 'fast-chests': True, 'fast-keys': True, 'keysanity': 'off', 'randomize-environments': False,
-        'skip-story-events': True, 'tunic-color': 'default', 'enemy-minibosses': False, 'no-buff-drops': False,
+        'skip-story-events': True, 'tunic-color': 'default', 'enemy-minibosses': False, 'enemy-bosses': False, 'no-buff-drops': False,
         'bushes': False, 'boss-souls': False, 'miniboss-souls': False,
         'digs': False,  # digsanity: every diggable overworld tile is a check (tools/rando/digs.py)
         'hookshot-anything': False,  # the hookshot latches onto anything (tools/rando/hookshot_logic.py)
@@ -617,6 +617,9 @@ def main():
         print('roam:', roam.write(out_dir, _uw_leb, romfs), flush=True)
         import miniboss_guard  # (copies of a mini-boss whose flow gives a check don't give it again)
         print('miniboss guard:', miniboss_guard.apply(out_dir, romfs, _uw_leb, _uw_ev, _ot, settings), flush=True)
+    if settings.get('enemy-bosses'):  # overworld bosses don't give their dungeon boss's item (tools/rando/boss_guard.py)
+        import boss_guard
+        print('boss guard:', boss_guard.apply(out_dir, romfs, _uw_leb, _uw_ev, _ot, settings), flush=True)
     if pot_locs or bush_locs or dig_locs:  # (after every flow edit) refills at real checks are refills, not the item
         import refill_gets
         print('refill gets:', refill_gets.apply(out_dir, romfs, settings), flush=True)
