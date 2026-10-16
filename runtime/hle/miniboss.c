@@ -50,6 +50,7 @@ static const Kind g_kinds[] = {
     {MAIN_BASE + 0x1b9fe60, 0, 0x1340, 0x260, 0, 0, "Genie", 0xff, 0, 0, 0, 1},      // 0x64
     {MAIN_BASE + 0x1b91228, 0, 0xff0, 0x260, 0, 0, "Facade", 0xff, 0, 0, 0, 1},      // 0x68
     {MAIN_BASE + 0x1b70940, 0, 0xff0, 0x260, 0, 0, "Hot Head", 0xff, 0, 0, 0, 1},    // 0x6a
+    {MAIN_BASE + 0x1b792e8, 0, 0xff0, 0x260, 0, 0, "Hardhit Beetle", 0xff, 0, 0, 0, 1},  // 0x62 (14: paused while Link is away)
 };
 #define NKINDS (int)(sizeof g_kinds / sizeof g_kinds[0])
 #define WAKE_DIST 7.0f  // (a Field screen is ~15 x 12 units)
