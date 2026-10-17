@@ -2045,7 +2045,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             int kind = key ? key->rt_kind[rt] : 0;
             sp(&s, "  %s4 c%d [[color(%d)]];\n", kind == 1 ? "int" : kind == 2 ? "uint" : "float", rt, rt);
         }
-        if (c->omap_depth) { sp(&s, "  float depth [[depth(any)]];\n"); info->writes_depth = true; }
+        if (c->omap_depth || (key && key->depth_offset)) { sp(&s, "  float depth [[depth(any)]];\n"); info->writes_depth = true; }
         sp(&s, "};\n");
     }
 
@@ -2072,6 +2072,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         sp(&args, ", constant float4 *ltint [[buffer(19)]]");
         info->uses_tint = true;
     }
+    bool doff = stage == STAGE_FRAGMENT && !c->glsl && key && key->depth_offset;
+    if (doff) sp(&args, ", constant float4 *poff [[buffer(20)]]");
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
         const char *tn = tex_type_name(t->type);
@@ -2088,6 +2090,9 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     } else if (stage == STAGE_FRAGMENT) {
         sp(&s, "fragment FOut main0(FIn in [[stage_in]], bool front_facing [[front_facing]]%s%s) {\n",
            c->uses_lane ? ", uint lane [[thread_index_in_simdgroup]]" : "", args.buf ? args.buf : "");
+        // (the depth slope for the polygon offset, first: derivatives after a discard are undefined - a depth
+        // pre-pass and its EQUAL colour pass then disagreed: speckles)
+        if (doff) sp(&s, "  float doff_dz = max(abs(dfdx(in.pos.z)), abs(dfdy(in.pos.z)));\n");
     } else {
         sp(&s, "kernel void main0(uint3 tid [[thread_position_in_threadgroup]], uint3 ctaid [[threadgroup_position_in_grid]]%s) {\n",
            args.buf ? args.buf : "");
@@ -2141,6 +2146,19 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (c->omap_depth) {
             if (c->reg_used[r + 1]) sp(&s, "  o.depth = as_type<float>(r%d);\n", r + 1);
             else sp(&s, "  o.depth = in.pos.z;\n");
+        }
+        if (doff) {  // polygon offset in the shader, as the hardware's: factor * the depth slope + units * the smallest
+            // step of the depth buffer (a unorm one's 1 / (2^bits - 1), passed in .w; a 32-bit float one's at this depth,
+            // 2^(exponent - 23), from the exponent bits), clamped (> 0: at
+            // most, < 0: at least). Bit-exact across shaders (exact operations, explicit fma; renderer.m compiles these
+            // without fast math): a depth pre-pass and its EQUAL colour pass must land on the same depth.
+            if (!c->omap_depth) sp(&s, "  o.depth = in.pos.z;\n");
+            sp(&s, "  { float dz = doff_dz;\n"
+                   "    uint e = as_type<uint>(o.depth) & 0x7F800000u;\n"
+                   "    float rr = poff[0].w > 0.0f ? poff[0].w : e > (23u << 23) ? as_type<float>(e - (23u << 23)) : 0.0f;\n"
+                   "    float b = fma(poff[0].x, dz, poff[0].y * rr);\n"
+                   "    if (poff[0].z > 0.0f) b = min(b, poff[0].z); else if (poff[0].z < 0.0f) b = max(b, poff[0].z);\n"
+                   "    o.depth = saturate(o.depth + b); }\n");
         }
         sp(&s, "  return o;\n}\n");
     } else {

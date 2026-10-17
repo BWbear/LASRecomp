@@ -865,7 +865,13 @@ static void compile_program(Prog *pr) {
     NSString *salt = getenv("LARECOMP_SHADER_SALT") ? [NSString stringWithFormat:@"\n// %s\n", getenv("LARECOMP_SHADER_SALT")] : @"";
     id<MTLLibrary> vl = [dev newLibraryWithSource:[@(pr->vi->msl) stringByAppendingString:salt] options:vopts error:&err];
     if (!vl) { LOG("[shader] VS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->vi->msl); pr->failed = true; return; }
-    id<MTLLibrary> fl = [dev newLibraryWithSource:[@(pr->fi->msl) stringByAppendingString:salt] options:nil error:&err];
+    // (a fragment shader applying a polygon offset (ShaderKey depth_offset): no fast math, so a depth pre-pass and its
+    // EQUAL colour pass compute the same depth - fast math rounded them apart: stripes)
+    static MTLCompileOptions *exact;
+    static dispatch_once_t once_exact;
+    dispatch_once(&once_exact, ^{ exact = [MTLCompileOptions new]; exact.mathMode = MTLMathModeSafe; });
+    id<MTLLibrary> fl = [dev newLibraryWithSource:[@(pr->fi->msl) stringByAppendingString:salt]
+                                          options:strstr(pr->fi->msl, "poff[0]") ? exact : nil error:&err];
     if (!fl) { LOG("[shader] FS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->fi->msl); pr->failed = true; return; }
     pr->vs = [vl newFunctionWithName:@"main0"];
     pr->fs = [fl newFunctionWithName:@"main0"];
@@ -1615,6 +1621,17 @@ static void draw(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+    // Polygon offset in the shader instead of Metal's depth bias (issue #52: an M4 on macOS 26.4 drew floor decals over
+    // walls - black areas - whenever depth bias was on at all, however small). LARECOMP_BIAS_SHADER=0 / 1 / 2:
+    static int bias_shader = -1;
+    // 1 (default): negative offsets only - decals pulled toward the camera, the black areas. Positive ones (shadow maps)
+    // stay on Metal's bias: the shader's per-pixel slope differs from the hardware's per-triangle one enough to show as
+    // shadow acne. 2: all offsets. 0: none.
+    if (bias_shader < 0) bias_shader = getenv("LARECOMP_BIAS_SHADER") ? atoi(getenv("LARECOMP_BIAS_SHADER")) : 1;
+    // (on both keys: get_program's cache keys on vkey, and the fragment translation reads fkey - as mirror mode's flip_x)
+    vkey.depth_offset = fkey.depth_offset = bias_shader && (st.poly[3] & 4) && !getenv("LARECOMP_NO_DEPTH_BIAS") &&
+                                            (bias_shader >= 2 ? st.poly_offset[0] != 0 || st.poly_offset[1] != 0
+                                                             : st.poly_offset[0] < 0 || st.poly_offset[1] < 0);
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || !pr->ready) { stat_skipped++; return; }
     {   // mirror mode (runtime/hle/mirror.c): the scene's composite into the window image is drawn mirrored - the
@@ -1826,19 +1843,22 @@ static void draw(CmdRec *r, bool indexed) {
     // depth / stencil
     static uint64_t last_dsk;
     static id<MTLDepthStencilState> last_dss;
-    uint64_t dsk = hmix(hmix(hmix(0xcbf29ce484222325ull, st.ds, 8), st.stencil_mask, sizeof st.stencil_mask), st.stencil_vmask, sizeof st.stencil_vmask);
+    // shader polygon offset (issue #52): a decal's depth prepass and its EQUAL colour pass compute the offset depth a few
+    // ulps apart (per-pixel derivatives, unlike the fixed-function bias), so EQUAL runs as LESS_EQUAL for those draws
+    bool eq_le = fkey.depth_offset && st.ds[2] == 3;
+    uint64_t dsk = hmix(hmix(hmix(0xcbf29ce484222325ull, st.ds, 8), st.stencil_mask, sizeof st.stencil_mask), st.stencil_vmask, sizeof st.stencil_vmask) ^ eq_le;
     id<MTLDepthStencilState> dss = dsk == last_dsk ? last_dss : nil;
     NSString *dk = nil;
     if (!dss) {
-        dk = [NSString stringWithFormat:@"ds %02x%02x%02x%02x%02x%02x%02x%02x %x %x %x %x", st.ds[0], st.ds[1], st.ds[2], st.ds[3],
-                    st.ds[4], st.ds[5], st.ds[6], st.ds[7], st.stencil_mask[0], st.stencil_vmask[0], st.stencil_mask[1], st.stencil_vmask[1]];
+        dk = [NSString stringWithFormat:@"ds %02x%02x%02x%02x%02x%02x%02x%02x %x %x %x %x%s", st.ds[0], st.ds[1], st.ds[2], st.ds[3],
+                    st.ds[4], st.ds[5], st.ds[6], st.ds[7], st.stencil_mask[0], st.stencil_vmask[0], st.stencil_mask[1], st.stencil_vmask[1], eq_le ? " le" : ""];
         dss = cache[dk];
     }
     if (!dss) {
         MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
         static int nodt = -1;
         if (nodt < 0) nodt = getenv("LARECOMP_NO_DEPTH_TEST") != NULL;
-        if (st.ds[0] && !nodt) { dd.depthCompareFunction = compare_fn(st.ds[2]); dd.depthWriteEnabled = st.ds[1] != 0; }
+        if (st.ds[0] && !nodt) { dd.depthCompareFunction = eq_le ? MTLCompareFunctionLessEqual : compare_fn(st.ds[2]); dd.depthWriteEnabled = st.ds[1] != 0; }
         else { dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = NO; }
         if (st.ds[3]) {
             uint32_t ops = st.ds[5] | st.ds[6] << 8 | st.ds[7] << 16;
@@ -1876,6 +1896,13 @@ static void draw(CmdRec *r, bool indexed) {
         static int off = -1;  // LARECOMP_NO_DEPTH_BIAS: ignore the game's polygon offset (A/B tests)
         if (off < 0) off = getenv("LARECOMP_NO_DEPTH_BIAS") != NULL;
         if ((st.poly[3] & 4) && !off) memcpy(f, st.poly_offset, sizeof f);
+        if (fkey.depth_offset) {  // (in the shader: Metal's stays off. .w: a unorm depth buffer's unit; 0: float, per depth)
+            float unit = 0;
+            if (st.rt.depth && st.rt.depth->format == 0x32) unit = 1.0f / 65535.0f;  // (D16: Depth16Unorm)
+            float pv[4] = {f[0], f[1], f[2], unit};
+            [enc setFragmentBytes:pv length:sizeof pv atIndex:20];
+            f[0] = f[1] = f[2] = 0;
+        }
         static int nlog;
         if ((st.poly[3] & 4) && nlog < 3 && getenv("LARECOMP_LOG_BIAS")) { nlog++; LOG("[bias] factor %g units %g clamp %g\n", st.poly_offset[0], st.poly_offset[1], st.poly_offset[2]); }
         if (memcmp(f, last, sizeof f) || enc != last_bias_enc) {

@@ -43,6 +43,8 @@ typedef struct {
     bool flip_y;            // lower-left window origin
     bool flip_x;            // mirror the image left to right (mirror mode's scene composite). (In the padding
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
+    bool depth_offset;      // (MSL fragment) the draw's polygon offset applied in the shader: buffer 20, float4
+                            // factor, units, clamp - instead of Metal's depth bias (renderer.m; issue #52). (Padding too)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
 } ShaderKey;
