@@ -68,6 +68,11 @@ int rt_hook(Cpu *c, uint64_t site) {
         if (c->x[0]) return 0;
         LOG("[event] empty handler skipped (issue #41)\n");
         return 2;  // (the dispatcher's catch: returns 0)
+    case GA_ITEM_GET_SLOT_VT_SITE:  // ITEM_GET_SLOT_VT_SITE - ldr x8, [x0]: item-get slot object (issue #183)
+        // Guest heap/code live at 0x7000000000..; 0x10001 during Mermaid Scale trade is not a pointer.
+        if (c->x[0] >= 0x7000000000ull && c->x[0] < 0x7400000000ull) return 0;
+        LOG("[item] bad slot pointer %#llx - skipped (issue #183)\n", (unsigned long long)c->x[0]);
+        return 2;  // epilogue: clear the busy flag and return
     case GA_FRAME_JOB_KICKOFF_SITES_0:  // FRAME_JOB_KICKOFF_SITES - a frame job's rebuild waits for its last finish (#19)
     case GA_FRAME_JOB_KICKOFF_SITES_1:
     case GA_FRAME_JOB_KICKOFF_SITES_2:

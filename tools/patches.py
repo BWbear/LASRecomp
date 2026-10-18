@@ -729,6 +729,12 @@ for _a in DELEGATE_FORWARDER_SITES:
 # with Warp tab jumps; same family as NO_HANDLER_SITES (the action dispatcher's).
 EMPTY_HANDLER_SITE = A.EMPTY_HANDLER_SITE  # bl main+0x108dfc0
 
+# Issue #183: item-get / dialog presentation (main+0xef2250). After calling three fixed UI slots it indexes
+# another slot (obj+0x58 + i*0x18) and does `ldr x8, [x0]` with no null check. During the Mermaid Scale trade
+# dialog that pointer was the small integer 0x10001 (SIGSEGV). Nearby siblings `cbz` first; this hook skips to
+# the function epilogue when x0 is not a guest pointer.
+ITEM_GET_SLOT_VT_SITE = A.ITEM_GET_SLOT_VT_SITE  # ldr x8, [x0]
+
 # Issue #19 (the hang): the per-frame kick-off (main+0x15730, four inlined copies, one per owner X) rebuilds X's frame
 # job J (X+0xc8) in place. The job worker (main+0x13c21e0) runs J (main+0x10cceb0: sets X's done flag, wakes the main
 # thread, unlocks) and only then calls J's finish (main+0x10ccfa0 -> slot +0x00: base vtable, delegate cleared). A
@@ -766,6 +772,7 @@ HOOKS = {
     HOLE_CAP_SITES[0]: (0xf101451f, (), 'cmp x8, #0x51: dug-hole limit (digs.c)'),
     HOLE_CAP_SITES[1]: (0xf101411f, (), 'cmp x8, #0x50: dug-hole limit (digs.c)'),
     EMPTY_HANDLER_SITE: (0x9400005e, (A.EMPTY_HANDLER_CATCH,), 'bl std::function call: an empty event handler, as its catch'),
+    ITEM_GET_SLOT_VT_SITE: (0xf9400008, (A.ITEM_GET_SLOT_VT_SKIP,), 'ldr x8, [x0]: item-get slot vtable, skip if not a guest pointer (issue #183)'),
     FRAME_JOB_KICKOFF_SITES[0]: (0x910782d3, (), 'add x19, x22, #0x1e0: frame job kick-off, previous finish first'),
     FRAME_JOB_KICKOFF_SITES[1]: (0x910782d3, (), 'add x19, x22, #0x1e0: frame job kick-off, previous finish first'),
     FRAME_JOB_KICKOFF_SITES[2]: (0x910782d3, (), 'add x19, x22, #0x1e0: frame job kick-off, previous finish first'),
