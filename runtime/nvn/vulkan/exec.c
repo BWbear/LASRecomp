@@ -1222,6 +1222,7 @@ typedef struct {
     bool vs_uses_vid;
     _Atomic int state;  // 0 building, 1 ready, 2 failed
     uint64_t prep_vh, prep_fh;  // (prepared programs: their code hashes, for LARECOMP_PREP_CHECK)
+    struct PipeMemo *pmemo;  // (render thread) draw_'s pipeline key memo for this program
 } Prog;
 
 static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, VkShaderStageFlags s1) {
@@ -1345,7 +1346,36 @@ static uint64_t prog_content_key(uint64_t vh, uint64_t fh, const ShaderKey *vkey
 #define PROG_TAB 4096
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 
+// Key memo: draws mostly repeat the program and pipeline state of a recent draw, so draw_ compares the inputs of the
+// program lookup with the previous draw's, and those of the pipeline lookup with the last ones of that program
+// (plain compares), and reuses the answer instead of hashing ~80 bytes byte by byte and filling + hashing the
+// ~700-byte PipeKey. Answers are the objects the tables give (exact input compare). key_gen: bumped by vk_exec_reset
+// (tables cleared). LARECOMP_VK_KEY_MEMO=0: off.
+static int key_memo = -1;
+static uint32_t key_gen;
+static bool key_memo_on(void) {
+    if (key_memo < 0) { const char *e = getenv("LARECOMP_VK_KEY_MEMO"); key_memo = !e || atoi(e) != 0; }
+    return key_memo;
+}
+
+static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey);
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
+    static struct { uint64_t code[2]; ShaderKey vkey; uint8_t rt[8]; uint32_t gen; Prog *prog; } m;
+    bool on = key_memo_on();
+    if (on && m.prog && m.gen == key_gen && (np->stage_mask & 3) == 3 && m.code[0] == np->stages[0].code_addr &&
+        m.code[1] == np->stages[1].code_addr && !memcmp(&m.vkey, vkey, sizeof *vkey) && !memcmp(m.rt, fkey->rt_kind, 8)) {
+        prof_prog_memo++;
+        return m.prog;
+    }
+    Prog *p = get_program_(np, vkey, fkey);
+    if (on && p) {
+        m.code[0] = np->stages[0].code_addr; m.code[1] = np->stages[1].code_addr;
+        m.vkey = *vkey; memcpy(m.rt, fkey->rt_kind, 8); m.gen = key_gen; m.prog = p;
+    }
+    return p;
+}
+
+static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
     uint64_t h = 0xcbf29ce484222325ull;
     for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
@@ -1566,6 +1596,15 @@ typedef struct {
 } PipeKey;
 
 typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; } Pipe;  // state: 0 building, 1 ready, 2 failed
+// (key memo, see get_program) everything pipe_key_fill reads besides the program: the pass's formats and the PipeIn.
+// One per program (draws often alternate between a few programs): the last pipeline that program drew with.
+struct PipeMemo {
+    uint32_t gen, ncolor, samples, nattrib, nstream, channel_mask;
+    VkFormat color[8], depth, stencil;
+    uint32_t attrib[16], stream[16][2], rt_fmt[8];
+    uint8_t blend[8][8], blend_on, a2c, cls, poly_fill;
+    Pipe *pp;
+};
 #define PIPE_TAB 8192
 static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
 
@@ -2558,6 +2597,7 @@ static int g_cs_n;  // (compute program table below)
 void vk_exec_reset(void) {
     memset(prog_tab, 0, sizeof prog_tab);
     memset(pipe_tab, 0, sizeof pipe_tab);
+    key_gen++;
     g_cs_n = 0;
     gcopy_gen++;
     if (gmem_buf) {
@@ -3149,36 +3189,64 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.rt.ncolor && i < 8; i++) rt_fmt[i] = st.rt.color[i] ? st.rt.color[i]->format : 0;
     const PipeIn in = {st.attrib, st.nattrib, (const uint32_t (*)[2])st.stream, st.nstream, rt_fmt, st.channel_mask,
                        st.color_state[0], (const uint8_t (*)[8])st.blend, st.ms[0xC] != 0, cls, st.poly[2] != 1};
-    PipeKey k;
-    pipe_key_fill(&k, pr, &in, pass_color, pass_ncolor, pass_depth, pass_stencil, pass_samples);
-    uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
-    if (!ph) ph = 1;
-    uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
-    while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
-    Pipe *pp = pipe_tab[pslot].pipe;
-    if (!pp) {
-        if (shader_rec_recording()) {
-            ShaderRec rec;
-            rec_from_state(&rec, vkey.flip_x, mode);
-            shader_rec_note(&rec);
-        }
-        pp = prep_pipes_n ? PREP_GET(prep_pipes, ph) : NULL;  // prepared before the game
-        if (pp && memcmp(&pp->k, &k, sizeof k)) pp = NULL;
+    bool memo_on = key_memo_on();
+    if (memo_on && !pr->pmemo) pr->pmemo = calloc(1, sizeof *pr->pmemo);
+    struct PipeMemo *pm = memo_on ? pr->pmemo : NULL;
+    Pipe *pp;
+    uint32_t nat = st.nattrib > 0 ? (uint32_t)st.nattrib : 0, nst = st.nstream > 0 ? (uint32_t)st.nstream : 0;
+    if (nat > 16) nat = 16;
+    if (nst > 16) nst = 16;
+    if (pm && pm->pp && pm->gen == key_gen && pm->ncolor == pass_ncolor && pm->samples == pass_samples &&
+        pm->depth == pass_depth && pm->stencil == pass_stencil && pm->nattrib == (uint32_t)st.nattrib && pm->nstream == (uint32_t)st.nstream &&
+        pm->channel_mask == in.channel_mask && pm->blend_on == in.blend_on && pm->a2c == in.a2c && pm->cls == in.topo_class &&
+        pm->poly_fill == in.poly_fill && !memcmp(pm->color, pass_color, pass_ncolor * sizeof pass_color[0]) &&
+        !memcmp(pm->rt_fmt, rt_fmt, sizeof rt_fmt) && !memcmp(pm->attrib, st.attrib, nat * 4) &&
+        !memcmp(pm->stream, st.stream, nst * 8) && !memcmp(pm->blend, st.blend, sizeof pm->blend)) {
+        prof_pipe_memo++;
+        pp = pm->pp;
+    } else {
+        PipeKey k;
+        pipe_key_fill(&k, pr, &in, pass_color, pass_ncolor, pass_depth, pass_stencil, pass_samples);
+        uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
+        if (!ph) ph = 1;
+        uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
+        while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
+        pp = pipe_tab[pslot].pipe;
         if (!pp) {
-            uint64_t vh = shader_stage_hash(&st.program->stages[0]), fh = shader_stage_hash(&st.program->stages[1]);
-            shader_first_visit("pipeline", vh, fh, ph);
-            if (prep_check_on()) {
+            if (shader_rec_recording()) {
                 ShaderRec rec;
                 rec_from_state(&rec, vkey.flip_x, mode);
-                prep_check(&k, vh, fh, &rec);
+                shader_rec_note(&rec);
             }
-            pp = calloc(1, sizeof *pp);
-            pp->k = k;
-            run_job(build_pipeline, pp);
+            pp = prep_pipes_n ? PREP_GET(prep_pipes, ph) : NULL;  // prepared before the game
+            if (pp && memcmp(&pp->k, &k, sizeof k)) pp = NULL;
+            if (!pp) {
+                uint64_t vh = shader_stage_hash(&st.program->stages[0]), fh = shader_stage_hash(&st.program->stages[1]);
+                shader_first_visit("pipeline", vh, fh, ph);
+                if (prep_check_on()) {
+                    ShaderRec rec;
+                    rec_from_state(&rec, vkey.flip_x, mode);
+                    prep_check(&k, vh, fh, &rec);
+                }
+                pp = calloc(1, sizeof *pp);
+                pp->k = k;
+                run_job(build_pipeline, pp);
+            }
+            pipe_tab[pslot].key = ph;
+            pipe_tab[pslot].pipe = pp;
         }
-        pipe_tab[pslot].key = ph;
-        pipe_tab[pslot].pipe = pp;
+        if (pm) {
+            pm->gen = key_gen; pm->ncolor = pass_ncolor; pm->samples = pass_samples; pm->depth = pass_depth;
+            pm->stencil = pass_stencil; pm->nattrib = (uint32_t)st.nattrib; pm->nstream = (uint32_t)st.nstream;
+            pm->channel_mask = in.channel_mask; pm->blend_on = in.blend_on; pm->a2c = in.a2c; pm->cls = in.topo_class;
+            pm->poly_fill = in.poly_fill;
+            memcpy(pm->color, pass_color, sizeof pm->color); memcpy(pm->rt_fmt, rt_fmt, sizeof pm->rt_fmt);
+            memcpy(pm->attrib, st.attrib, sizeof pm->attrib); memcpy(pm->stream, st.stream, sizeof pm->stream);
+            memcpy(pm->blend, st.blend, sizeof pm->blend);
+            pm->pp = pp;
+        }
     }
+    const PipeKey *kp = &pp->k;  // (== the key filled above: a table hit has the same key, prepared ones are compared)
     if (atomic_load(&pp->state) != 1) { stat_skipped++; return; }
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
@@ -3420,7 +3488,7 @@ static void draw_(CmdRec *r, bool indexed) {
 
     // ---- vertex streams: the range this draw can read, copied once per submission
     for (int s = 0; s < 17; s++) {
-        if (!(k.used_streams & (1u << s))) continue;
+        if (!(kp->used_streams & (1u << s))) continue;
         VkSpan sp;
         if (s == ZERO_BINDING) {
             static const float zero[4] = {0, 0, 0, 1};
@@ -3442,9 +3510,9 @@ static void draw_(CmdRec *r, bool indexed) {
                 if (base_vertex > 0) max_index += (uint32_t)base_vertex;
                 scan_src = NULL;
             }
-            uint64_t stride = k.stride[s], need;
+            uint64_t stride = kp->stride[s], need;
             if (!stride) need = 256;
-            else if (k.divisor[s]) need = ((uint64_t)base_inst + inst + k.divisor[s] - 1) / k.divisor[s] * stride + 256;
+            else if (kp->divisor[s]) need = ((uint64_t)base_inst + inst + kp->divisor[s] - 1) / kp->divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
             if (v.size && need > v.size) need = v.size;
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
