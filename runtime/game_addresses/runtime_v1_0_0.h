@@ -58,6 +58,16 @@
 #define GA_MASTER_STALFOS_VTABLE            UINT64_C(0x7001b8ea08)
 #define GA_MASTER_STALFOS_CHANGE_STATE      UINT64_C(0x70004b9be0)
 
+// Boss classes (enemy randomizer "Include bosses")
+#define GA_MOLDORM_VTABLE                  UINT64_C(0x7001b71f38)
+#define GA_MOLDORM_CHANGE_STATE            UINT64_C(0x70002a0840)
+#define GA_GENIE_VTABLE                    UINT64_C(0x7001b9fe60)
+#define GA_FACADE_VTABLE                   UINT64_C(0x7001b91228)
+#define GA_HOT_HEAD_VTABLE                 UINT64_C(0x7001b70940)
+#define GA_HARDHIT_BEETLE_VTABLE           UINT64_C(0x7001b792e8)
+#define GA_CHARA_BODY_COLLISION_VT         UINT64_C(0x7001c4fed0)
+#define GA_DEGU_TAIL_BODY_ATTACK_STRING    UINT64_C(0x70016c2147)
+
 #define GA_MAIN_CODE_SIZE                  UINT64_C(0x16a0000)
 #define GA_DELEGATE_JOB_VTABLE_LIVE         UINT64_C(0x7001c51308)
 #define GA_DELEGATE_JOB_VTABLE_BASE         UINT64_C(0x7001c51358)

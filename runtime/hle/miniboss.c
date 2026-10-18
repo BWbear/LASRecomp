@@ -45,13 +45,13 @@ static const Kind g_kinds[] = {
     // 0x59: 12 = hidden until his room's event (AreaEventBox - not copied: intro, music) drops him in; 13 shows him
     {GA_MASTER_STALFOS_VTABLE, GA_MASTER_STALFOS_CHANGE_STATE, 0x1230, 0x260, 12, 13, "Master Stalfos", 0xff, 1, 1},
     // bosses (enemy randomizer "Include bosses"): started by their own event (arm)
-    {MAIN_BASE + 0x1b71f38, MAIN_BASE + 0x2a0840, 0xff0, 0x260, 6, 4, "Moldorm", 0xff, 0, 0, 0, 1},  // 0x63: 6 = waits for
+    {GA_MOLDORM_VTABLE, GA_MOLDORM_CHANGE_STATE, 0xff0, 0x260, 6, 4, "Moldorm", 0xff, 0, 0, 0, 1},  // 0x63: 6 = waits for
     // its start box (armed); 4 = what the box's callback (main+0x2a1200) does: its Start event (an overworld copy's
     // only shows it - tools/rando/boss_guard.py), then it crawls (0). 17 = paused while Link is screens away
-    {MAIN_BASE + 0x1b9fe60, 0, 0x1340, 0x260, 0, 0, "Genie", 0xff, 0, 0, 0, 1},      // 0x64
-    {MAIN_BASE + 0x1b91228, 0, 0xff0, 0x260, 0, 0, "Facade", 0xff, 0, 0, 0, 1},      // 0x68
-    {MAIN_BASE + 0x1b70940, 0, 0xff0, 0x260, 0, 0, "Hot Head", 0xff, 0, 0, 0, 1},    // 0x6a
-    {MAIN_BASE + 0x1b792e8, 0, 0xff0, 0x260, 0, 0, "Hardhit Beetle", 0xff, 0, 0, 0, 1},  // 0x62 (14: paused while Link is away)
+    {GA_GENIE_VTABLE, 0, 0x1340, 0x260, 0, 0, "Genie", 0xff, 0, 0, 0, 1},      // 0x64
+    {GA_FACADE_VTABLE, 0, 0xff0, 0x260, 0, 0, "Facade", 0xff, 0, 0, 0, 1},      // 0x68
+    {GA_HOT_HEAD_VTABLE, 0, 0xff0, 0x260, 0, 0, "Hot Head", 0xff, 0, 0, 0, 1},    // 0x6a
+    {GA_HARDHIT_BEETLE_VTABLE, 0, 0xff0, 0x260, 0, 0, "Hardhit Beetle", 0xff, 0, 0, 0, 1},  // 0x62 (14: paused while Link is away)
 };
 #define NKINDS (int)(sizeof g_kinds / sizeof g_kinds[0])
 #define WAKE_DIST 7.0f  // (a Field screen is ~15 x 12 units)
@@ -427,7 +427,7 @@ static void moldorm_solid_off(Cpu *c, uint64_t actor) {
     memcpy(saved, c->x, sizeof saved);
     for (int part = 0; part < 5; part++) {
         uint64_t comp = LD64(actor + 0x1548 + part * 0x10);
-        if (!comp || LD64(comp) != MAIN_BASE + 0x1c4fed0) continue;
+        if (!comp || LD64(comp) != GA_CHARA_BODY_COLLISION_VT) continue;
         c->x[0] = comp, c->x[1] = 0;
         guest_call(c, LD64(LD64(comp) + 0x58));
     }
@@ -490,7 +490,7 @@ void miniboss_tick(Cpu *c, uint64_t frame) {
             uint64_t saved[31], sp = c->sp;
             memcpy(saved, c->x, sizeof saved);
             c->x[0] = s->obj;
-            guest_call(c, MAIN_BASE + 0x29520);  // (the zone manager's room-entry call: f_7000029520 -> vfunc +0x100)
+            guest_call(c, GA_AREA_EVENT_TRIGGER);  // (the zone manager's room-entry call: f_7000029520 -> vfunc +0x100)
             memcpy(c->x, saved, sizeof saved);
             c->sp = sp;
             if (k->chg) {  // (then straight into its fight - without waiting for Link to walk into its start box)
@@ -548,7 +548,6 @@ void miniboss_tick(Cpu *c, uint64_t frame) {
 // description (kept by rt_moldorm_shape as the head's is made) on the segment's model and its "root" bone, the
 // component (f_7000043220, named AttackColComp1..3), the attack data DeguTail:body_attack (vfunc +0x80), enabled
 // (+0xa8). Our references are dropped once he's gone (moldorm_attacks_tick).
-#define SP_RELEASE (MAIN_BASE + 0xbae080)
 static uint8_t g_mshape[0x100], g_mshape_s[0x20];
 static bool g_mshape_ok;
 static struct { uint64_t actor, ctrl[3]; } g_mextra[16];
@@ -582,16 +581,16 @@ void rt_moldorm_attacks(Cpu *c) {
         memcpy((void *)(uintptr_t)shp, g_mshape_s, sizeof g_mshape_s);
         ST64(shp + 0x10, shp + 0x18);
         c->x[0] = blk, c->x[1] = shp, c->x[2] = root;
-        guest_call(c, MAIN_BASE + 0xcdae0);
+        guest_call(c, GA_COLLIDER_DESC_INIT);
         snprintf((char *)(uintptr_t)cname, 16, "AttackColComp%d", part);
         ST64(nm, cname), ST64(nm + 8, strlen((const char *)(uintptr_t)cname));
         ST64(mdl, model), ST64(mdl + 8, mctrl);
         ST64(out, 0), ST64(out + 8, 0);
         c->x[0] = out, c->x[1] = actor, c->x[2] = nm, c->x[3] = mdl, c->x[4] = blk;
-        guest_call(c, MAIN_BASE + 0x43220);
+        guest_call(c, GA_ATTACK_COL_COMP_CREATE);
         uint64_t comp = LD64(out);
         if (comp) {
-            c->x[0] = comp, c->x[1] = MAIN_BASE + 0x16c2147;  // "DeguTail:body_attack"
+            c->x[0] = comp, c->x[1] = GA_DEGU_TAIL_BODY_ATTACK_STRING;  // "DeguTail:body_attack"
             c->pc = LD64(LD64(comp) + 0x80), guest_call(c, c->pc);
             c->x[0] = comp, c->x[1] = 1;
             guest_call(c, LD64(LD64(comp) + 0xa8));
@@ -605,11 +604,11 @@ void rt_moldorm_attacks(Cpu *c) {
 
 static void moldorm_attacks_tick(Cpu *c) {  // (he's gone - deleted or another actor in his place: our references go)
     for (int i = 0; i < 16; i++) {
-        if (!g_mextra[i].actor || LD64(g_mextra[i].actor) == MAIN_BASE + 0x1b71f38) continue;
+        if (!g_mextra[i].actor || LD64(g_mextra[i].actor) == GA_MOLDORM_VTABLE) continue;
         uint64_t saved[31], sp = c->sp;
         memcpy(saved, c->x, sizeof saved);
         for (int k = 0; k < 3; k++)
-            if (g_mextra[i].ctrl[k]) { c->x[0] = g_mextra[i].ctrl[k]; guest_call(c, SP_RELEASE); }
+            if (g_mextra[i].ctrl[k]) { c->x[0] = g_mextra[i].ctrl[k]; guest_call(c, GA_SP_RELEASE); }
         memcpy(c->x, saved, sizeof saved);
         c->sp = sp;
         memset(&g_mextra[i], 0, sizeof g_mextra[i]);

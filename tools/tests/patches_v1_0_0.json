@@ -188,6 +188,14 @@
     "700111e000": {
       "word": "3940e008",
       "sha256": "50e1bfede9b483d9fe9a9c2d3b7b1188fcc74f341c5e8c7f3cb7dcdc1231cb36"
+    },
+    "7000298d18": {
+      "word": "97f8d372",
+      "sha256": "60f882a673246984a83eefd0c46642d1fe85c48312a5d8bcf7b33b878c83c703"
+    },
+    "7000298d64": {
+      "word": "97f6a92f",
+      "sha256": "b5c404f4bbef7889c1f080e56efdbcc6a35ef2ce5e7104b9ffe767a5058e9272"
     }
   },
   "hooks_sha256": "71d272519ede964150c8f6fd02df899d7cf4b3ff39305c8cc4660c980263bc08"
