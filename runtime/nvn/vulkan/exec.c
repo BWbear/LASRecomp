@@ -30,6 +30,10 @@ static uint64_t stat_upload_bytes;
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
 static int prof = -1;
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
+// ("detail" in the stats line) pass: begin_pass beginning a pass (part of pre); setw: descriptor set allocate + write
+// (part of sets); bind: vkCmdBindDescriptorSets. Counts: sets allocated / reused, program and pipeline key lookups
+// answered by the previous draw's (memo).
+static uint64_t prof_pass, prof_setw, prof_bind, prof_sets_new, prof_sets_reused, prof_prog_memo, prof_pipe_memo;
 static VkQueryPool prof_qp;
 static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
 static uint32_t prof_end_line[4096];  // passes ended, by the exec.c line that ended them (0: submit / present)
@@ -739,6 +743,11 @@ const char *renderer_stats(void) {
         snprintf(stats_text + n, sizeof stats_text - n, " | gpu %.0f cpu exec %.0f draw %.0f (pre %.0f key %.0f dyn %.0f sets %.0f tex %.0f (upload %.0f) vtx %.0f) submit %.0f ms",
                  prof_gpu / 1e6, prof_exec / 1e6, prof_draw / 1e6, prof_pre / 1e6, prof_key / 1e6, prof_dyn / 1e6, prof_sets / 1e6,
                  prof_tex / 1e6, prof_up / 1e6, prof_vtx / 1e6, prof_submit / 1e6);
+        n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | detail: pass %.1f setw %.1f bind %.1f ms, sets new %llu reused %llu, memo prog %llu pipe %llu",
+                 prof_pass / 1e6, prof_setw / 1e6, prof_bind / 1e6, (unsigned long long)prof_sets_new, (unsigned long long)prof_sets_reused,
+                 (unsigned long long)prof_prog_memo, (unsigned long long)prof_pipe_memo);
+        prof_pass = prof_setw = prof_bind = prof_sets_new = prof_sets_reused = prof_prog_memo = prof_pipe_memo = 0;
         extern uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn;
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | tex checks %llu samples %llu full %llu (%.1f MB, dynamic %llu)",
@@ -885,8 +894,14 @@ static void vk_end_pass_at(int line) {
 
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
 
+static void begin_pass_(void);
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
+    PROF_T0();
+    begin_pass_();
+    PROF_ADD(prof_pass);
+}
+static void begin_pass_(void) {
     vk_end_pass();
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     st.rt_dirty = false;
@@ -2615,7 +2630,10 @@ static float g_mirror_w;  // mirror mode's composite: its render target width (r
 
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii) {
+    uint64_t prof_ta_ = prof ? SDL_GetTicksNS() : 0;
     VkDescriptorSet ds = vk_alloc_set(layout);
+    if (prof) prof_setw += SDL_GetTicksNS() - prof_ta_;
+    prof_sets_new++;
     VkWriteDescriptorSet w[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
     VkDescriptorImageInfo ii[MAX_BIND];
@@ -2669,7 +2687,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         w[n].pBufferInfo = &bi[n];
         n++;
     }
+    prof_ta_ = prof ? SDL_GetTicksNS() : 0;
     if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
+    if (prof) prof_setw += SDL_GetTicksNS() - prof_ta_;
     return ds;
 }
 
@@ -3332,7 +3352,9 @@ static void draw_(CmdRec *r, bool indexed) {
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii);
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
+    prof_t1_ = prof ? SDL_GetTicksNS() : 0;
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);  // (always new sets)
+    if (prof) prof_bind += SDL_GetTicksNS() - prof_t1_;
     if (pr->vi->uses_gmem_store) vc_mark_sbufs(0);
     if (pr->fi->uses_gmem_store) vc_mark_sbufs(1);
 
