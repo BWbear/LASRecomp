@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "hle.h"
 #include "input_bind.h"
@@ -21,6 +22,8 @@ Settings g_settings = {
     .volume = 1.0f,
     .reverb = true,
     .movie_audio = true,
+    .rumble = true,
+    .rumble_strength = 100,
     .show_fps = false,
     .inv_keys = true,
     .tracker = true,
@@ -49,6 +52,21 @@ static const char *host_language(void) {
     if (!e || !*e) e = getenv("LC_MESSAGES");
     if (!e || !*e) e = getenv("LANG");
     if (!e || !*e || !strcmp(e, "C") || !strcmp(e, "POSIX")) return "en-US";
+    if (!strncmp(e, "zh", 2) && (!e[2] || strchr("_-.@", e[2]))) {
+        char locale[64];
+        snprintf(locale, sizeof locale, "%s", e);
+        locale[strcspn(locale, ".@")] = 0;
+        for (char *p = locale; *p; ++p) *p = (char)tolower((unsigned char)*p);
+        bool traditional = false;
+        char *next;
+        for (char *part = strtok_r(locale, "_-", &next); part; part = strtok_r(NULL, "_-", &next)) {
+            // An explicit script takes precedence over the region, e.g. zh-Hans-HK.
+            if (!strcmp(part, "hant")) return "zh-Hant";
+            if (!strcmp(part, "hans")) return "zh-Hans";
+            if (!strcmp(part, "tw") || !strcmp(part, "hk") || !strcmp(part, "mo")) traditional = true;
+        }
+        return traditional ? "zh-Hant" : "zh-Hans";
+    }
     char l[8] = {0};
     size_t n = 0;
     for (const char *p = e; *p && *p != '.' && *p != '@' && *p != '_' && n < sizeof l - 1; p++) l[n++] = *p;
@@ -56,7 +74,6 @@ static const char *host_language(void) {
                                                              {"de", "de"}, {"it", "it"}, {"fr", "fr"}, {"es", "es"}};
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(l, map[i].loc)) return map[i].code;
-    if (!strcmp(l, "zh")) return e[n] == '_' && e[n + 1] == 'T' ? "zh-Hant" : "zh-Hans";  // (TW / HK: traditional)
     return "en-US";
 }
 
@@ -81,14 +98,16 @@ void settings_load(void) {
     char line[256];
     bool tip_key = false, aspect_key = false;
     while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
         char key[64];
-        char val[128];
-        if (sscanf(line, " %63[^= ] = %127[^\n]", key, val) < 1) continue;
+        char val[128] = {0};
+        int fields = sscanf(line, " %63[^= ] = %127[^\n]", key, val);
+        if (fields < 1) continue;
         if (!strcmp(key, "rando_seed")) {
-            if (sscanf(line, " %63[^= ] = %127[^\n]", key, val) != 2) val[0] = 0;
             strlcpy(g_settings.rando_seed, val, sizeof g_settings.rando_seed);
             continue;
         }
+        if (fields != 2) continue;
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
@@ -105,6 +124,8 @@ void settings_load(void) {
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
         else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
+        else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) != 0;
+        else if (!strcmp(key, "rumble_strength")) g_settings.rumble_strength = atoi(val);
         else if (!strcmp(key, "move_360")) g_settings.move_360 = atoi(val) != 0;
         else if (!strcmp(key, "blur_removal")) g_settings.blur_removal = atoi(val) != 0;
         else if (!strcmp(key, "hide_hero_icon")) g_settings.hide_hero_icon = atoi(val) != 0;
@@ -140,6 +161,7 @@ void settings_load(void) {
     if (!aspect_key) g_settings.aspect_asked = true;  // (likewise: the aspect ratio was chosen already)
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
+    if (g_settings.rumble_strength < 25 || g_settings.rumble_strength > 100) g_settings.rumble_strength = 100;
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
 }
 
@@ -163,6 +185,8 @@ void settings_save(void) {
     else fprintf(f, "resolution = match\n");
     fprintf(f, "inv_keys = %d\n", g_settings.inv_keys);
     fprintf(f, "dpad_move = %d\n", g_settings.dpad_move);
+    fprintf(f, "rumble = %d\n", g_settings.rumble);
+    fprintf(f, "rumble_strength = %d\n", g_settings.rumble_strength);
     fprintf(f, "move_360 = %d\nblur_removal = %d\nhide_hero_icon = %d\n", g_settings.move_360, g_settings.blur_removal,
             g_settings.hide_hero_icon);
     static const char *const prompts[] = {"auto", "nintendo", "xbox", "playstation"};

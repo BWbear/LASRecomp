@@ -21,8 +21,7 @@ Pull requests that include Nintendo files can't be merged. Screenshots and short
 
 ## Reporting bugs
 
-Report bugs either on the [Discord](https://discord.gg/DhrgdYqdcY) or as a
-[GitHub issue](https://github.com/peiikai/LASRecomp/issues) - whichever you prefer. Please include:
+Report bugs as a [GitHub issue](https://github.com/peiikai/LASRecomp/issues). Please include:
 
 - your platform (macOS / Windows), hardware (CPU, GPU) and window size / aspect ratio
 - what you did, what happened, and what you expected
@@ -30,6 +29,19 @@ Report bugs either on the [Discord](https://discord.gg/DhrgdYqdcY) or as a
   (area / room, which items you had). A seed ID reproduces the exact seed on the same LAS Recomp version.
 - a screenshot or short clip if it's visual
 - for crashes: the log the app prints to the terminal (run it from a terminal to capture it)
+
+## Which branch to work from
+
+`main` holds the last release and isn't where development happens, so don't base your work on it. Work happens on
+the current development branch:
+
+- during the beta period: the latest `beta_<n>` branch (for example `beta_5`)
+- after 1.0: the latest `vX.Y.Zb` branch, for the next version (for example `v1.1.0b`)
+
+Pick the highest-numbered one in the [branch list](https://github.com/peiikai/LASRecomp/branches). Base your branch
+on it and open your pull request against it. Before you start, and again before opening the pull request, compare
+your change with what's already on that branch: it moves quickly, and the fix or feature you have in mind may
+already be there or in progress. Rebase onto it if it has moved since you branched.
 
 ## Building
 
@@ -43,6 +55,11 @@ them, then `make -j10`. The randomizer needs its Python environment in
 - `tools/gen.py` - the recompiler: translates the game's executables into C (`generated/`, never committed).
   `tools/patches.py` holds code patches applied during generation; every patch site checks the original instruction
   word, so a wrong address fails loudly instead of silently.
+- `runtime/game_addresses/patches_v1_0_0.h` - addresses used by the patch generator, read by
+  `tools/game_addresses.py` and included in the game-library identity. Runtime-only constants belong in
+  `runtime_v1_0_0.h`, so adding one does not invalidate generated code. The runtime includes both through
+  `game_addresses.h`. The current selection remains 1.0.0; guest memory layout constants and object field
+  offsets are separate. Existing instruction checks still guard patch sites.
 - `runtime/` - the host side:
   - `kernel.c`, `loader.c`, `services/` - the Switch OS replacement
   - `hle/` - replacements and features (door jumps, keysanity, pots / bushes, souls, warps, input, ...)
@@ -67,6 +84,13 @@ them, then `make -j10`. The randomizer needs its Python environment in
 - State that belongs to a seed must be reset when the player switches seeds in place: use an `RT_ON_RESET` hook
   (see `runtime/hle.h`).
 
+For address-table changes, run `python tools/test_game_addresses.py`. It checks native/Python agreement,
+patch-output fingerprints from the pre-refactor `beta_5` build, hook records and uncentralized addresses without
+game files. For full generation equivalence, generate from the same player-provided `exefs/main` and `exefs/sdk`
+with both revisions, then run `python tools/test_game_addresses.py --compare-generated /path/to/before /path/to/after`.
+The comparison checks every generated C file byte-for-byte. This table records the existing, verified 1.0.0
+sites; it does not yet discover addresses automatically from code patterns.
+
 ## Code style
 
 - Match the surrounding code: its naming, structure and comment density. Comments explain *why* (what the game does,
@@ -77,6 +101,7 @@ them, then `make -j10`. The randomizer needs its Python environment in
 
 ## Pull requests
 
+- Target the current development branch (see "Which branch to work from"), not `main`.
 - Keep each pull request focused on one change; small is easier to review.
 - Describe what changed, why, and how you tested it (platform, seeds, screenshots).
 - Don't include personal paths or information in code, comments or commit messages.

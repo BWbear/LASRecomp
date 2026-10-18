@@ -6,6 +6,9 @@
 
 #include "hle.h"
 #include "kernel.h"
+#ifdef _WIN32
+#include "platform/windows_threads.h"
+#endif
 
 // ------------------------------------------------------------------ results
 #undef R_OK
@@ -92,7 +95,7 @@ static void deadline(struct timespec *ts, int64_t timeout_ns) {
 
 // Sleep on the current thread's condition. Returns false on timeout. Caller holds g_klock.
 static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
-// Time this thread spent blocked in the kernel (waits, sleeps): idle, not work. Frame pacing (exec.c vk_pace_frame)
+// Time this thread spent blocked in the kernel (waits, sleeps): idle, not work. Frame pacing (nvn/pace.c)
 // takes the presenting thread's: a frame's busy time is its period minus this.
 __thread uint64_t g_blocked_ns;
 
@@ -187,6 +190,7 @@ void rt_unwind_point(void) {
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
+    plat_thread_guest(t->prio);
     crash_handler_install();
     rt_set_fpcr(0);
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
@@ -221,12 +225,18 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
 }
 
 static void thread_start(KThread *t) {
+#ifdef _WIN32
+    t->host = guest_thread_create(thread_main, t, 256u << 20);
+    if (!t->host) FATAL("Could not create a game thread.\n");
+    t->started = true;
+#else
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 256ull << 20);  // guest recursion runs on the host stack
     t->started = true;
     pthread_create(&t->host, &attr, thread_main, t);
     pthread_attr_destroy(&attr);
+#endif
 }
 
 KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio) {
@@ -313,6 +323,7 @@ static uint32_t block_current(int64_t timeout_ns) {
             break;
         }
         if (!kwait(timeout_ns, &ts)) {
+            if (t->wait_kind == WAIT_NONE) break;  // (woken just as the time ran out: the waker's result stands)
             t->wait_kind = WAIT_NONE;
             t->wait_result = R_TIMEOUT;
             break;
@@ -354,15 +365,11 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     t->wait_mutex = mutex;
     t->wait_tag = tag;
     __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
+    // Timed out / cancelled: returns without the mutex, as Horizon does - nn::os takes it again itself (TimedWait on
+    // 0xEA01 calls the critical section's Enter). Taking it here as well left the thread holding it when Enter ran:
+    // Enter saw its own handle in the lock word and ArbitrateLock waited on itself forever (issue #19's thread dump: a
+    // controller thread's timer-event wait).
     uint32_t r = block_current(timeout);
-    if (r != R_OK) {
-        // timed out / cancelled: still must reacquire the mutex
-        if (!mutex_acquire_or_mark(mutex, tag)) {
-            t->wait_kind = WAIT_MUTEX;
-            t->wait_addr = mutex;
-            block_current(-1);
-        }
-    }
     pthread_mutex_unlock(&g_klock);
     return r;
 }
@@ -813,7 +820,14 @@ void kernel_stop_threads(void (*idle)(void)) {
     }
     int n = 0;
     for (KThread *t = g_threads; t; t = t->anext)
-        if (t->started) { pthread_join(t->host, NULL); n++; }
+        if (t->started) {
+#ifdef _WIN32
+            if (!guest_thread_join(t->host)) FATAL("Could not join a game thread.\n");
+#else
+            pthread_join(t->host, NULL);
+#endif
+            n++;
+        }
     LOG("[reboot] %d guest threads stopped in %llums\n", n, (unsigned long long)((plat_now_ns() - t0) / 1000000));
 }
 

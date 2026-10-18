@@ -40,11 +40,13 @@ GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibi
 
 # The game code (made by `make gen` from your own game files) is its own library next to the app (runtime/gamelib.h);
 # the app itself holds none of it
-GEN_SRC  := $(wildcard $(GEN)/main/*.c) $(wildcard $(GEN)/sdk/*.c)
+# (strip: with no generated code the space between the two would be all that's left, and $(if) takes a lone space as
+# true. No comment after the value: make keeps the spaces before it)
+GEN_SRC  := $(strip $(wildcard $(GEN)/main/*.c) $(wildcard $(GEN)/sdk/*.c))
 GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/obj/tools/gamelib_entry.o
 RT_SRC   := $(wildcard runtime/*.c) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
-RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
+RT_HDRS  := $(wildcard runtime/*.h runtime/game_addresses/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
             $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
 UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(UI_SRC))
@@ -110,7 +112,7 @@ endif
 
 # GAMELIB_ID: what the game code library is built from (the generator, the headers it is compiled against, the
 # flags). A library with another id is rebuilt by the start screen, never loaded.
-GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py \
+GAMELIB_SRCS := tools/game_addresses.py runtime/game_addresses/patches_v1_0_0.h tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py \
                 tools/simd_c.py tools/rando/patch_variants.json tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h
 GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
@@ -154,6 +156,14 @@ $(B)/inc/smaa_hlsl.inc: third_party/smaa/SMAA.hlsl
 	LC_ALL=C tr -d '\r' < $< | LC_ALL=C tr '\200-\377' '?' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' > $@
 $(B)/rt/nvn/smaa_data.o: $(B)/inc/smaa_hlsl.inc
 $(B)/rt/nvn/smaa_data.o: RTFLAGS += -I$(B)/inc -Ithird_party/smaa/Textures
+
+# The shader preparation's variant list (runtime/nvn/shader_prep.h: no shader code, hashes and pipeline state only)
+# as a C string for runtime/nvn/shader_prep.c
+$(B)/inc/shader_variants.inc: runtime/nvn/shader_variants.txt
+	@mkdir -p $(dir $@)
+	(LC_ALL=C tr -d '\r' < $< | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/'; echo '""') > $@
+$(B)/rt/nvn/shader_prep.o: $(B)/inc/shader_variants.inc
+$(B)/rt/nvn/shader_prep.o: RTFLAGS += -I$(B)/inc
 
 $(B)/rt/%.o: runtime/%.cpp $(RT_HDRS)
 	@mkdir -p $(dir $@)
@@ -205,9 +215,9 @@ gen-objs: $(GEN_OBJ)
 # Runtime objects only (no generated code, no link): quick compile check
 runtime-objs: $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ)
 
-$(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico
+$(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico runtime/platform/windows.manifest
 	@mkdir -p $(dir $@)
-	$(WINDRES) -I docs/icon -O coff $< -o $@
+	$(WINDRES) -I docs/icon -I runtime/platform -O coff $< -o $@
 
 VERSION  := $(shell sed -n 's/^\#define LARECOMP_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)
 
