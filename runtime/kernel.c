@@ -255,6 +255,7 @@ void kernel_run_main(KThread *t, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t
 uint32_t kernel_current_thread_handle(void) { return t_cur ? t_cur->handle : 0; }
 Cpu *kernel_current_cpu(void) { return t_cur ? &t_cur->cpu : NULL; }
 KThread *kernel_current_thread(void) { return t_cur; }
+uint64_t kernel_current_thread_id(void) { return t_cur ? t_cur->id : 0; }
 
 // ------------------------------------------------------------------ mutex / condvar (Horizon semantics)
 // Mutex word: owner handle | WAITERS_BIT. Waiting threads sleep on the global cond and are handed ownership.
@@ -829,6 +830,22 @@ void kernel_stop_threads(void (*idle)(void)) {
             n++;
         }
     LOG("[reboot] %d guest threads stopped in %llums\n", n, (unsigned long long)((plat_now_ns() - t0) / 1000000));
+}
+
+// (diagnostics: the render thread's watchdog, runtime/nvn/rqueue.c) every guest thread and what it waits on. Doesn't
+// wait for g_klock: a hang may be holding it (then read as is, and said so).
+void kernel_dump_threads(const char *prefix) {
+    bool locked = false;
+    for (int i = 0; i < 100 && !(locked = pthread_mutex_trylock(&g_klock) == 0); i++) usleep(1000);
+    if (!locked) LOG("%s g_klock held for 100+ ms (by a stuck thread?): the thread list below is read without it\n", prefix);
+    static const char *const kinds[] = {"-", "mutex", "condvar", "arbiter"};
+    for (KThread *t = g_threads; t; t = t->anext)
+        if (t->started && !t->finished)
+            LOG("%s guest thread %llu prio %d core %d entry %llx pc %llx lr %llx wait %s addr %llx tag %x%s\n", prefix,
+                (unsigned long long)t->id, t->prio, t->core, (unsigned long long)t->entry, (unsigned long long)t->cpu.pc,
+                (unsigned long long)t->cpu.x[30], (unsigned)t->wait_kind < 4 ? kinds[t->wait_kind] : "?",
+                (unsigned long long)t->wait_addr, t->wait_tag, t->in_sync_wait ? " in WaitSynchronization" : "");
+    if (locked) pthread_mutex_unlock(&g_klock);
 }
 
 // Reboot, step 2 (threads stopped): a fresh kernel. Kernel objects are leaked rather than freed: host statics
