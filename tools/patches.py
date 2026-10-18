@@ -142,16 +142,16 @@ MOLDORM_ATTACK_SITE = A.MOLDORM_ATTACK_SITE
 def _moldorm_shape(gen, a):
     w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
     assert w == 0x97f8d372, hex(w)  # bl f_70000cdae0
-    return (addr_text('{ extern void rt_moldorm_shape(Cpu *); rt_moldorm_shape(c); } c->x[30] = 0x@MOLDORM_SHAPE_RETURN@ull; '
-                      'f_@COLLIDER_DESC_INIT@(c);') +
+    return (addr_text('{ extern void rt_moldorm_shape(Cpu *); extern void f_@COLLIDER_DESC_INIT@(Cpu *); rt_moldorm_shape(c); '
+                      'c->x[30] = 0x@MOLDORM_SHAPE_RETURN@ull; f_@COLLIDER_DESC_INIT@(c); }') +
             f'  /* {a:#x}: bl 0xcdae0 (Moldorm head attack shape: kept) */')
 
 
 def _moldorm_attack(gen, a):
     w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
     assert w == 0x97f6a92f, hex(w)  # bl f_7000043220
-    return (addr_text('c->x[30] = 0x@MOLDORM_ATTACK_RETURN@ull; f_@ATTACK_COL_COMP_CREATE@(c); '
-                      '{ extern void rt_moldorm_attacks(Cpu *); rt_moldorm_attacks(c); }') +
+    return (addr_text('{ extern void f_@ATTACK_COL_COMP_CREATE@(Cpu *); extern void rt_moldorm_attacks(Cpu *); '
+                      'c->x[30] = 0x@MOLDORM_ATTACK_RETURN@ull; f_@ATTACK_COL_COMP_CREATE@(c); rt_moldorm_attacks(c); }') +
             f'  /* {a:#x}: bl 0x43220 (Moldorm head attack made; on the Field his body segments get one too) */')
 
 
