@@ -23,6 +23,8 @@
 #include "shader.h"
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
+uint32_t maxwell_gmem_chunk_shift;  // 0: one buffer for the whole heap (GLSL; shader.h)
+bool maxwell_gmem_lazy;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
@@ -1400,6 +1402,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         static const char *const ld_small[] = {"uint(gmem[ga])", "uint(int(char(gmem[ga])))",
                                                "uint(*(device ushort *)(gmem + ga))", "uint(int(*(device short *)(gmem + ga)))"};
         int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
+        bool lazy_wide = c->glsl && maxwell_gmem_chunk_shift && maxwell_gmem_lazy && nw > 1;  // (one chunk check per access)
         if (c->glsl && c->stage == STAGE_COMPUTE) {
             // Compute (Vulkan): the guest heap is host memory across PCIe on a discrete GPU, and a shader storing to
             // it in a loop crawls (the little chain chomps in Madam MeowMeow's house: ~4 ms a dispatch, ~0.07 ms without
@@ -1416,15 +1419,22 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     if (d != RZ) {
                         char fast[160], slow[160];
                         snprintf(fast, sizeof fast, gl_small[size], "gfast_.w[fw]");
-                        snprintf(slow, sizeof slow, gl_small[size], "gmem_.w[uint(ga >> 2)]");
+                        snprintf(slow, sizeof slow, gl_small[size], "GMR(uint(ga >> 2))");
                         c->reg_used[d] = 1;
                         sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? %s : ok ? %s : 0u;\n", d, fast, slow);
                     }
+                } else if (lazy_wide) {
+                    sp(&c->body, "      { uvec%d t = fw != 0xFFFFFFFFu ? uvec%d(", nw, nw);
+                    for (int k = 0; k < nw; k++) sp(&c->body, "%sgfast_.w[fw + %du]", k ? ", " : "", k);
+                    sp(&c->body, ") : ok ? GMR%d(uint(ga >> 2)) : uvec%d(0u);\n", nw, nw);
+                    for (int k = 0; k < nw; k++)
+                        if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "        r%d = t[%d];\n", d + k, k); }
+                    sp(&c->body, "      }\n");
                 } else {
                     for (int k = 0; k < nw; k++)
                         if (d != RZ && d + k < RZ) {
                             c->reg_used[d + k] = 1;
-                            sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? gfast_.w[fw + %du] : ok ? gmem_.w[uint(ga >> 2) + %du] : 0u;\n",
+                            sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? gfast_.w[fw + %du] : ok ? GMR(uint(ga >> 2) + %du) : 0u;\n",
                                d + k, k, k);
                         }
                 }
@@ -1436,39 +1446,53 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     const char *bm = size < 2 ? "3ul" : "2ul";
                     sp(&c->body, "      if (ok) { uint sh = uint(ga & %s) * 8u; uint v = (%s & 0x%xu) << sh;\n", bm, R(d), m);
                     sp(&c->body, "        if (fw != 0xFFFFFFFFu) { atomicAnd(gfast_.w[fw], ~(0x%xu << sh)); atomicOr(gfast_.w[fw], v); }\n", m);
-                    sp(&c->body, "        else { atomicAnd(gmem_.w[uint(ga >> 2)], ~(0x%xu << sh)); atomicOr(gmem_.w[uint(ga >> 2)], v); } }\n", m);
+                    sp(&c->body, "        else { GMAND(uint(ga >> 2), ~(0x%xu << sh)); GMOR(uint(ga >> 2), v); } }\n", m);
+                } else if (lazy_wide) {
+                    for (int k = 0; k < nw; k++) sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s;\n", k, R(d == RZ ? RZ : d + k));
+                    sp(&c->body, "      if (fw == 0xFFFFFFFFu && ok) GMW%d(uint(ga >> 2), uvec%d(", nw, nw);
+                    for (int k = 0; k < nw; k++) sp(&c->body, "%s%s", k ? ", " : "", R(d == RZ ? RZ : d + k));
+                    sp(&c->body, "));\n");
                 } else {
                     for (int k = 0; k < nw; k++)
-                        sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s; else if (ok) gmem_.w[uint(ga >> 2) + %du] = %s;\n", k,
+                        sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s; else if (ok) GMW(uint(ga >> 2) + %du, %s);\n", k,
                            R(d == RZ ? RZ : d + k), k, R(d == RZ ? RZ : d + k));
                 }
             }
-        } else if (c->glsl) {  // gmem_.w[]: 32-bit words; sub-word accesses within the containing word
+        } else if (c->glsl) {  // 32-bit words (GMR / GMW / GMAND / GMOR: the prelude); sub-word accesses within the containing word
             static const char *const gl_small[] = {
-                "(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)) & 0xFFu",
-                "uint(sx8(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)))",
-                "(gmem_.w[uint(ga >> 2)] >> (uint(ga & 2ul) * 8u)) & 0xFFFFu",
-                "uint(sx16(gmem_.w[uint(ga >> 2)] >> (uint(ga & 2ul) * 8u)))"};
+                "(GMR(uint(ga >> 2)) >> (uint(ga & 3ul) * 8u)) & 0xFFu",
+                "uint(sx8(GMR(uint(ga >> 2)) >> (uint(ga & 3ul) * 8u)))",
+                "(GMR(uint(ga >> 2)) >> (uint(ga & 2ul) * 8u)) & 0xFFFFu",
+                "uint(sx16(GMR(uint(ga >> 2)) >> (uint(ga & 2ul) * 8u)))"};
             if (!store) {
                 if (size < 4) {
                     if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      if (ok) r%d = %s; else r%d = 0u;\n", d, gl_small[size], d); }
+                } else if (lazy_wide) {  // (one bounds check and address for the whole aligned access)
+                    sp(&c->body, "      { uvec%d t = ok ? GMR%d(uint(ga >> 2)) : uvec%d(0u);\n", nw, nw, nw);
+                    for (int k = 0; k < nw; k++)
+                        if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "        r%d = t[%d];\n", d + k, k); }
+                    sp(&c->body, "      }\n");
                 } else {
                     for (int k = 0; k < nw; k++)
                         if (d != RZ && d + k < RZ) {
                             c->reg_used[d + k] = 1;
-                            sp(&c->body, "      if (ok) r%d = gmem_.w[uint(ga >> 2) + %du]; else r%d = 0u;\n", d + k, k, d + k);
+                            sp(&c->body, "      if (ok) r%d = GMR(uint(ga >> 2) + %du); else r%d = 0u;\n", d + k, k, d + k);
                         }
                 }
             } else {
                 c->uses_gmem_store = true;
                 c->info->uses_gmem_store = true;  // (the draw marks the pages it stores to: vertex cache copies go stale)
                 if (size < 4)
-                    sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; atomicAnd(gmem_.w[wi], ~(0x%xu << sh)); "
-                       "atomicOr(gmem_.w[wi], (%s & 0x%xu) << sh); }\n", size < 2 ? "3ul" : "2ul", size < 2 ? 0xFFu : 0xFFFFu, R(d),
+                    sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; GMAND(wi, ~(0x%xu << sh)); "
+                       "GMOR(wi, (%s & 0x%xu) << sh); }\n", size < 2 ? "3ul" : "2ul", size < 2 ? 0xFFu : 0xFFFFu, R(d),
                        size < 2 ? 0xFFu : 0xFFFFu);
-                else
+                else if (lazy_wide) {
+                    sp(&c->body, "      if (ok) GMW%d(uint(ga >> 2), uvec%d(", nw, nw);
+                    for (int k = 0; k < nw; k++) sp(&c->body, "%s%s", k ? ", " : "", R(d == RZ ? RZ : d + k));
+                    sp(&c->body, "));\n");
+                } else
                     for (int k = 0; k < nw; k++)
-                        sp(&c->body, "      if (ok) gmem_.w[uint(ga >> 2) + %du] = %s;\n", k, R(d == RZ ? RZ : d + k));
+                        sp(&c->body, "      if (ok) GMW(uint(ga >> 2) + %du, %s);\n", k, R(d == RZ ? RZ : d + k));
             }
         } else if (!store) {
             if (size < 4) {
@@ -1802,7 +1826,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->fail) { free(body.buf); free(c->body.buf); free(c); return info; }
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
-    sp(&s, "%s", glsl_prelude);
+    sp(&s, "#version 460\n");  // (the prelude's first line; an extension directive has to follow it)
+    if (info->uses_gmem && maxwell_gmem_chunk_shift && maxwell_gmem_lazy) sp(&s, "#extension GL_EXT_buffer_reference : require\n");
+    sp(&s, "%s", glsl_prelude + sizeof "#version 460\n" - 1);
     static int exact = -1;
     if (exact < 0) exact = getenv("LARECOMP_VK_EXACT_H2F") && atoi(getenv("LARECOMP_VK_EXACT_H2F")) != 0;
     sp(&s, "%s%s", !exact && (stage == STAGE_FRAGMENT || stage == STAGE_COMPUTE) ? glsl_h2f_native : glsl_h2f_exact,
@@ -1815,9 +1841,61 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (!n) n = 1;
         sp(&s, "layout(std140, set = %d, binding = %d) uniform CB%d { uvec4 cb%d[%u]; };\n", set, i, i, i, n);
     }
-    if (info->uses_gmem)
+    if (info->uses_gmem && !maxwell_gmem_chunk_shift) {
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
+        sp(&s, "#define GMR(i) gmem_.w[i]\n");
+        if (c->uses_gmem_store)
+            sp(&s, "#define GMW(i, v) gmem_.w[i] = (v)\n#define GMAND(i, m) atomicAnd(gmem_.w[i], m)\n"
+                   "#define GMOR(i, m) atomicOr(gmem_.w[i], m)\n");
+    } else if (info->uses_gmem && !maxwell_gmem_lazy) {  // the heap in windows, one binding each, plain branches (shader.h)
+        int n = maxwell_gmem_chunks(), ws = (int)maxwell_gmem_chunk_shift - 2, cs = GMEM_CHUNK_SET(stage);
+        for (int k = 0; k < n; k++)
+            sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem%d { uint w[]; } gmem%d_;\n", cs, GMEM_CHUNK_BINDING + k,
+               c->uses_gmem_store ? "" : "readonly ", k, k);
+        sp(&s, "uint GMR_(uint i) { uint c = i >> %du, o = i & 0x%xu;\n", ws, (1u << ws) - 1);
+        for (int k = 0; k < n; k++) sp(&s, "  if (c == %du) return gmem%d_.w[o];\n", k, k);
+        sp(&s, "  return 0u; }\n#define GMR(i) GMR_(i)\n");
+        if (c->uses_gmem_store) {
+            static const char *const ops[3][2] = {{"GMW_", "gmem%d_.w[o] = v"}, {"GMAND_", "atomicAnd(gmem%d_.w[o], v)"},
+                                                  {"GMOR_", "atomicOr(gmem%d_.w[o], v)"}};
+            for (int op = 0; op < 3; op++) {
+                sp(&s, "void %s(uint i, uint v) { uint c = i >> %du, o = i & 0x%xu;\n", ops[op][0], ws, (1u << ws) - 1);
+                for (int k = 0; k < n; k++) {
+                    char body[64];
+                    snprintf(body, sizeof body, ops[op][1], k);
+                    sp(&s, "  if (c == %du) { %s; return; }\n", k, body);
+                }
+                sp(&s, "}\n");
+            }
+            sp(&s, "#define GMW(i, v) GMW_(i, v)\n#define GMAND(i, m) GMAND_(i, m)\n#define GMOR(i, m) GMOR_(i, m)\n");
+        }
+    } else if (info->uses_gmem) {  // chunks imported lazily: a table of device addresses, buffer references (shader.h)
+        int ws = (int)maxwell_gmem_chunk_shift - 2, cs = GMEM_CHUNK_SET(stage);
+        sp(&s, "layout(std140, set = %d, binding = %d) uniform GChunks { uvec4 gchunk[%d]; };\n", cs, GMEM_CHUNK_BINDING, GMEM_CHUNKS_MAX);
+        sp(&s, "layout(buffer_reference, std430, buffer_reference_align = 4) %sbuffer GW { uint w[]; };\n", c->uses_gmem_store ? "" : "readonly ");
+        sp(&s, "layout(std430, set = %d, binding = %d) buffer GMiss { uint n[%d]; uint w[%d]; } gmiss_;\n", cs, GMEM_MISS_BINDING,
+           GMEM_CHUNKS_MAX, GMEM_CHUNKS_MAX);
+        sp(&s, "void gmiss(uint c, uint i) { atomicAdd(gmiss_.n[c], 1u); atomicMin(gmiss_.w[c], i); }\n");
+        // (gchunk[c]: x, y = device address, z = words; the first word's chunk holds the whole aligned access)
+        sp(&s, "#define GMC(i) ((i) >> %du)\n#define GMO(i) ((i) & 0x%xu)\n", ws, (1u << ws) - 1);
+        sp(&s, "uint GMR1(uint i) { uint c = GMC(i), o = GMO(i); uvec4 e = gchunk[c]; if (o < e.z) return GW((uint64_t(e.y) << 32) | uint64_t(e.x)).w[o]; gmiss(c, i); return 0u; }\n");
+        sp(&s, "uvec2 GMR2(uint i) { uint c = GMC(i), o = GMO(i); uvec4 e = gchunk[c]; if (o + 1u < e.z) { GW p = GW((uint64_t(e.y) << 32) | uint64_t(e.x)); "
+               "return uvec2(p.w[o], p.w[o + 1u]); } gmiss(c, i); return uvec2(0u); }\n");
+        sp(&s, "uvec4 GMR4(uint i) { uint c = GMC(i), o = GMO(i); uvec4 e = gchunk[c]; if (o + 3u < e.z) { GW p = GW((uint64_t(e.y) << 32) | uint64_t(e.x)); "
+               "return uvec4(p.w[o], p.w[o + 1u], p.w[o + 2u], p.w[o + 3u]); } gmiss(c, i); return uvec4(0u); }\n");
+        sp(&s, "#define GMR(i) GMR1(i)\n");
+        if (c->uses_gmem_store) {
+            sp(&s, "void GMW1(uint i, uint v) { uint c = GMC(i), o = GMO(i); uvec4 e = gchunk[c]; if (o < e.z) GW((uint64_t(e.y) << 32) | uint64_t(e.x)).w[o] = v; else gmiss(c, i); }\n");
+            sp(&s, "void GMW2(uint i, uvec2 v) { uint c = GMC(i), o = GMO(i); uvec4 e = gchunk[c]; if (o + 1u < e.z) { GW p = GW((uint64_t(e.y) << 32) | uint64_t(e.x)); "
+                   "p.w[o] = v.x; p.w[o + 1u] = v.y; } else gmiss(c, i); }\n");
+            sp(&s, "void GMW4(uint i, uvec4 v) { uint c = GMC(i), o = GMO(i); uvec4 e = gchunk[c]; if (o + 3u < e.z) { GW p = GW((uint64_t(e.y) << 32) | uint64_t(e.x)); "
+                   "p.w[o] = v.x; p.w[o + 1u] = v.y; p.w[o + 2u] = v.z; p.w[o + 3u] = v.w; } else gmiss(c, i); }\n");
+            sp(&s, "void GMAND1(uint i, uint v) { uint c = GMC(i), o = GMO(i); uvec4 e = gchunk[c]; if (o < e.z) atomicAnd(GW((uint64_t(e.y) << 32) | uint64_t(e.x)).w[o], v); else gmiss(c, i); }\n");
+            sp(&s, "void GMOR1(uint i, uint v) { uint c = GMC(i), o = GMO(i); uvec4 e = gchunk[c]; if (o < e.z) atomicOr(GW((uint64_t(e.y) << 32) | uint64_t(e.x)).w[o], v); else gmiss(c, i); }\n");
+            sp(&s, "#define GMW(i, v) GMW1(i, v)\n#define GMAND(i, m) GMAND1(i, m)\n#define GMOR(i, m) GMOR1(i, m)\n");
+        }
+    }
     if (info->uses_gmem_map) {  // (compute) the dispatch's storage buffers, device-local: gmap[i] = heap offset, size, word
         sp(&s, "layout(std140, set = %d, binding = %d) uniform GMap { uvec4 gmap[%d]; };\n", set, GMAP_BUFFER_INDEX, GMAP_MAX + 1);
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GFast { uint w[]; } gfast_;\n", set, GFAST_BUFFER_INDEX,

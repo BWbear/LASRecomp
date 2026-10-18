@@ -87,6 +87,25 @@ typedef struct {
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// (GLSL / Vulkan) The heap reaches shaders in chunks of 1 << maxwell_gmem_chunk_shift bytes in two cases:
+// - windows of one import where a storage buffer can't span the heap (Intel: 1 GB, issue #8): one binding per window
+//   (GMEM_CHUNK_BINDING + k in set GMEM_CHUNK_SET) and plain branches, cheap to run and to compile;
+// - chunks imported as the game binds them (AMD APUs: vulkan/exec.c gmem_lazy; maxwell_gmem_lazy): the shader takes
+//   the chunk's device address and size from a table (GChunks, binding 0) and goes through a buffer reference after
+//   one bounds check per LDG / STG (an aligned 8 or 16 byte access never crosses a chunk). A chunk not imported has
+//   size 0: the access reads 0 / drops the store and counts in GMiss (binding 1), with the lowest word index hit.
+//   (A per-access switch over constant descriptors, tried first, took the NVIDIA driver ~40 s to compile for the
+//   chain chomps' compute shader with 87 access sites, and Intel ran it as a loop over the wave.)
+// 0: one buffer.
+extern uint32_t maxwell_gmem_chunk_shift;
+extern bool maxwell_gmem_lazy;
+#define GMEM_CHUNKS_MAX 256  // chunks at most (HEAP_MAX in 16 MB chunks is 208)
+#define GMEM_CHUNK_SET(stage) ((stage) == STAGE_COMPUTE ? 1 : 2)
+#define GMEM_CHUNK_BINDING 0  // windows: GMem<k> at binding k; lazy: the GChunks table
+#define GMEM_MISS_BINDING 1   // lazy: GMiss { uint n[GMEM_CHUNKS_MAX]; uint w[GMEM_CHUNKS_MAX]; } (accesses, lowest word hit)
+static inline int maxwell_gmem_chunks(void) {
+    return maxwell_gmem_chunk_shift ? (int)((maxwell_gmem_size + (1ull << maxwell_gmem_chunk_shift) - 1) >> maxwell_gmem_chunk_shift) : 1;
+}
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;
