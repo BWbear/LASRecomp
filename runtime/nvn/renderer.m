@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 #include <mach/mach_time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1086,9 +1087,50 @@ static void remove_old_text_cache(void) {  // (cache/shaders/*.metal: up to ~130
     LOG("[metal] removed the old shader text cache (%d files)\n", n);
 }
 
+// Metal's archive writer (macOS 26+) takes the AIR, pipeline script and reflection of every entry it queued in
+// _airntExtraBinaryEntries (pipelines stored through its "archiver id" path: most of them, on an M3 Max too) without checking
+// them: one without (seen on an M4) and serializeToURL crashes (dispatch_retain(NULL) in
+// materializeAirNTFromOnlineForSlice). Checked first, under Metal's own queue for those tables: such an entry and the
+// archive isn't saved (nor used any more this run - macOS's own shader cache still is). Without those fields (other
+// macOS versions): saved as before.
+@protocol ArchiveKey
+- (id)initWithHash:(const void *)hash;
+@end
+@protocol ArchiveEntry
+- (id)bitcode;
+- (id)airScript;
+- (id)reflectionBlock;
+@end
+
+static bool archive_writable(id<MTLBinaryArchive> a) {
+    Class c = objc_getClass("_MTLBinaryArchive"), kc = objc_getClass("MTLBinaryKey"), ec = objc_getClass("MTLBinaryEntry");
+    Ivar xi = c ? class_getInstanceVariable(c, "_airntExtraBinaryEntries") : NULL;
+    Ivar ei = c ? class_getInstanceVariable(c, "_entries") : NULL, qi = c ? class_getInstanceVariable(c, "_queue") : NULL;
+    if (!xi || !ei || !qi || !kc || !ec || ![(id)a isKindOfClass:c] || strncmp(ivar_getTypeEncoding(xi), "{vector<", 8) ||
+        ![kc instancesRespondToSelector:@selector(initWithHash:)] || ![ec instancesRespondToSelector:@selector(reflectionBlock)])
+        return true;
+    __block bool ok = true;
+    dispatch_sync(object_getIvar(a, qi), ^{
+        char *const *v = (char *const *)((char *)(__bridge void *)a + ivar_getOffset(xi));  // (begin, end: 16-byte items,
+        NSDictionary *entries = object_getIvar(a, ei);                                     // each a key's hash first)
+        if ((v[1] - v[0]) % 16) return;
+        for (char *p = v[0]; p && p < v[1] && ok; p += 16) {
+            id<ArchiveEntry> e = entries[[(id<ArchiveKey>)[kc alloc] initWithHash:*(void **)p]];
+            if ([(id)e isKindOfClass:ec] && (!e.bitcode || !e.airScript || !e.reflectionBlock)) ok = false;
+        }
+    });
+    return ok;
+}
+
 static void archive_save(bool at_exit) {
     if (!archive_get() || !g_archive_dirty) return;
     if (at_exit ? pthread_rwlock_trywrlock(&g_archive_lock) : pthread_rwlock_wrlock(&g_archive_lock)) return;
+    if (!archive_writable(g_archive)) {  // (no add runs while the lock is held)
+        g_archive_ready = false;
+        pthread_rwlock_unlock(&g_archive_lock);
+        LOG("[metal] shader archive not saved: Metal can't write it on this Mac (no archive this run)\n");
+        return;
+    }
     int adds = g_archive_dirty;
     g_archive_dirty = 0;
     double t0 = now_ms();
