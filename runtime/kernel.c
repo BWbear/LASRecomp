@@ -839,12 +839,16 @@ void kernel_dump_threads(const char *prefix) {
     for (int i = 0; i < 100 && !(locked = pthread_mutex_trylock(&g_klock) == 0); i++) usleep(1000);
     if (!locked) LOG("%s g_klock held for 100+ ms (by a stuck thread?): the thread list below is read without it\n", prefix);
     static const char *const kinds[] = {"-", "mutex", "condvar", "arbiter"};
+    extern const char *hle_name_at(uint64_t pc);
     for (KThread *t = g_threads; t; t = t->anext)
-        if (t->started && !t->finished)
-            LOG("%s guest thread %llu prio %d core %d entry %llx pc %llx lr %llx wait %s addr %llx tag %x%s\n", prefix,
+        if (t->started && !t->finished) {
+            const char *hle = hle_name_at(t->cpu.pc);  // (pc: the last call through dispatch; an HLE one: its name)
+            LOG("%s guest thread %llu prio %d core %d entry %llx pc %llx%s%s%s lr %llx wait %s addr %llx tag %x%s\n", prefix,
                 (unsigned long long)t->id, t->prio, t->core, (unsigned long long)t->entry, (unsigned long long)t->cpu.pc,
-                (unsigned long long)t->cpu.x[30], (unsigned)t->wait_kind < 4 ? kinds[t->wait_kind] : "?",
-                (unsigned long long)t->wait_addr, t->wait_tag, t->in_sync_wait ? " in WaitSynchronization" : "");
+                hle ? " (" : "", hle ? hle : "", hle ? ")" : "", (unsigned long long)t->cpu.x[30],
+                (unsigned)t->wait_kind < 4 ? kinds[t->wait_kind] : "?", (unsigned long long)t->wait_addr, t->wait_tag,
+                t->in_sync_wait ? " in WaitSynchronization" : "");
+        }
     if (locked) pthread_mutex_unlock(&g_klock);
 }
 
