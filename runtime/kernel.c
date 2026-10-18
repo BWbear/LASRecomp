@@ -305,7 +305,11 @@ static void waitlist_remove(KThread *t) {
         if (*p == t) { *p = t->wnext; return; }
 }
 
-// Block until wait_kind is cleared by a waker, timeout, or cancel. Caller holds g_klock.
+// Block until wait_kind is cleared by a waker, timeout, or a reboot. Caller holds g_klock.
+// CancelSynchronization doesn't end these waits (mutex, condition variable, address arbiter), as on Horizon: its flag
+// is for the thread's next WaitSynchronization only. Ending them used the flag up there (a cancel meant to wake a
+// thread out of a WaitSynchronization could be lost), and the SDK's untimed condition variable wait treats any
+// result but success as fatal.
 static uint32_t block_current(int64_t timeout_ns) {
     KThread *t = t_cur;
     struct timespec ts;
@@ -313,12 +317,6 @@ static uint32_t block_current(int64_t timeout_ns) {
     waitlist_add(t);
     while (t->wait_kind != WAIT_NONE) {
         if (g_rt_unwind) {  // reboot: give up the wait (the thread unwinds when its svc returns)
-            t->wait_kind = WAIT_NONE;
-            t->wait_result = R_CANCELLED;
-            break;
-        }
-        if (t->cancel) {
-            t->cancel = false;
             t->wait_kind = WAIT_NONE;
             t->wait_result = R_CANCELLED;
             break;
@@ -375,6 +373,24 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     return r;
 }
 
+// (diagnostics: kernel_dump_threads) the latest condition variable signals and CancelSynchronization calls (g_klock)
+#define SIGLOG 128
+static struct { uint64_t key, ns, by; int32_t count, woken; bool cancel; } siglog[SIGLOG];
+static unsigned nsiglog;
+#define SIGTAB 2048  // (per key, direct-mapped: the last signal of each condition variable)
+static struct { uint64_t key, ns, by; int32_t count, woken; } sigtab[SIGTAB];
+static void siglog_add(uint64_t key, int32_t count, int woken, bool cancel) {
+    if (!cancel) {
+        unsigned j = (unsigned)((key >> 2) ^ (key >> 13)) % SIGTAB;
+        sigtab[j].key = key, sigtab[j].ns = plat_now_ns(), sigtab[j].by = t_cur ? t_cur->id : 0;
+        sigtab[j].count = count, sigtab[j].woken = woken;
+        return;
+    }
+    unsigned i = nsiglog++ % SIGLOG;
+    siglog[i].key = key, siglog[i].ns = plat_now_ns(), siglog[i].by = t_cur ? t_cur->id : 0;
+    siglog[i].count = count, siglog[i].woken = woken, siglog[i].cancel = cancel;
+}
+
 static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
     pthread_mutex_lock(&g_klock);
     int woken = 0;
@@ -400,6 +416,7 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
     for (KThread *t = g_waitlist; t; t = t->wnext)
         if (t->wait_kind == WAIT_CONDVAR && t->wait_addr == key) any_left = true;
     if (!any_left) __atomic_store_n(u32p(key), 0, __ATOMIC_SEQ_CST);
+    siglog_add(key, count, woken, false);
     pthread_mutex_unlock(&g_klock);
 }
 
@@ -413,8 +430,11 @@ static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value
     bool wait;
     if (type == ARB_WAIT_LESS) wait = cur < value;
     else if (type == ARB_DEC_WAIT_LESS) {
-        wait = cur < value;
-        if (wait) __atomic_store_n(u32p(addr), (uint32_t)(cur - 1), __ATOMIC_SEQ_CST);
+        // Atomically, as Horizon: the game changes these words in user space (exclusive load / store, no kernel
+        // lock), and a plain store of the value read before overwrote such a change - a lost signal.
+        uint32_t v = (uint32_t)cur;
+        while ((wait = (int32_t)v < value) &&
+               !__atomic_compare_exchange_n(u32p(addr), &v, v - 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
     } else if (type == ARB_WAIT_EQ) wait = cur == value;
     else { pthread_mutex_unlock(&g_klock); return R_INVALID_ENUM; }
     if (!wait) { pthread_mutex_unlock(&g_klock); return R_INVALID_STATE; }
@@ -426,18 +446,25 @@ static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value
     return r;
 }
 
-static int arbiter_wake(uint64_t addr, int32_t count) {
+static int arbiter_wake(uint64_t addr, int32_t count) {  // (the most urgent waiters first, as Horizon)
     int woken = 0;
-    for (KThread *t = g_waitlist; t; t = t->wnext) {
-        if (count > 0 && woken >= count) break;
-        if (t->wait_kind == WAIT_ARBITER && t->wait_addr == addr) {
-            t->wait_kind = WAIT_NONE;
-            t->wait_result = R_OK;
-            wake(t);
-            woken++;
-        }
+    while (count <= 0 || woken < count) {
+        KThread *best = NULL;
+        for (KThread *t = g_waitlist; t; t = t->wnext)
+            if (t->wait_kind == WAIT_ARBITER && t->wait_addr == addr && (!best || t->prio < best->prio)) best = t;
+        if (!best) break;
+        best->wait_kind = WAIT_NONE;
+        best->wait_result = R_OK;
+        wake(best);
+        woken++;
     }
     return woken;
+}
+
+// The word at addr from `expected` to `desired` if it still holds `expected` (user space may change it any time).
+static bool arbiter_update(uint64_t addr, int32_t expected, int32_t desired) {
+    uint32_t e = (uint32_t)expected;
+    return __atomic_compare_exchange_n(u32p(addr), &e, (uint32_t)desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 }
 
 static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
@@ -447,8 +474,8 @@ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t valu
     if (type == ARB_SIGNAL) {
         arbiter_wake(addr, count);
     } else if (type == ARB_SIGNAL_INC_EQ) {
-        if (cur != value) r = R_INVALID_STATE;
-        else { __atomic_store_n(u32p(addr), (uint32_t)(cur + 1), __ATOMIC_SEQ_CST); arbiter_wake(addr, count); }
+        if (!arbiter_update(addr, value, value + 1)) r = R_INVALID_STATE;
+        else arbiter_wake(addr, count);
     } else if (type == ARB_SIGNAL_MOD_EQ) {
         int waiting = 0;
         for (KThread *t = g_waitlist; t; t = t->wnext)
@@ -456,8 +483,8 @@ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t valu
         int32_t nv;
         if (count <= 0) nv = waiting > 0 ? value - 2 : value + 1;
         else nv = waiting == 0 ? value + 1 : (waiting <= count ? value - 1 : value);
-        if (cur != value) r = R_INVALID_STATE;
-        else { __atomic_store_n(u32p(addr), (uint32_t)nv, __ATOMIC_SEQ_CST); arbiter_wake(addr, count); }
+        if (!arbiter_update(addr, value, nv)) r = R_INVALID_STATE;
+        else arbiter_wake(addr, count);
     } else {
         r = R_INVALID_ENUM;
     }
@@ -491,10 +518,11 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
             if (!o) { r = R_INVALID_HANDLE; goto out; }
             if (o->signaled) { *index = i; r = R_OK; goto out; }
         }
+        if (timeout == 0) { r = R_TIMEOUT; goto out; }  // (before the cancel: a poll leaves it for the next real wait)
         if (t->cancel) { t->cancel = false; r = R_CANCELLED; goto out; }
         if (g_rt_unwind) { r = R_CANCELLED; goto out; }
-        if (timeout == 0) { r = R_TIMEOUT; goto out; }
         t->in_sync_wait = true;
+        t->sync_handles = handles_ptr, t->sync_count = count;
         t->snext = g_syncwaiters;
         g_syncwaiters = t;
         bool ok = kwait(timeout < 0 ? -1 : timeout, &ts);
@@ -703,6 +731,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         pthread_mutex_lock(&g_klock);
         KObject *o = handle_get((uint32_t)x[0]);
         if (o && o->type == KOBJ_THREAD) {
+            siglog_add(((KThread *)o)->id, 0, ((KThread *)o)->in_sync_wait, true);
             ((KThread *)o)->cancel = true;
             wake((KThread *)o);
             x[0] = R_OK;
@@ -848,7 +877,42 @@ void kernel_dump_threads(const char *prefix) {
                 hle ? " (" : "", hle ? hle : "", hle ? ")" : "", (unsigned long long)t->cpu.x[30],
                 (unsigned)t->wait_kind < 4 ? kinds[t->wait_kind] : "?", (unsigned long long)t->wait_addr, t->wait_tag,
                 t->in_sync_wait ? " in WaitSynchronization" : "");
+            if (t->cancel) LOG("%s   (a CancelSynchronization is pending for it)\n", prefix);
+            if (t->in_sync_wait)  // the objects it waits on
+                for (int i = 0; i < t->sync_count && i < 8; i++) {
+                    uint32_t h = ((const uint32_t *)(uintptr_t)t->sync_handles)[i];
+                    KObject *o = h >= 0x100 && h - 0x100 < MAX_HANDLES ? handles[h - 0x100] : NULL;
+                    static const char *const tn[] = {"?", "thread", "event", "session", "shared memory", "transfer memory"};
+                    extern uint32_t vi_vsync_handle(void);
+                    LOG("%s   handle %x: %s%s\n", prefix, h, o ? tn[o->type <= 5 ? o->type : 0] : "(none)",
+                        o ? (o->signaled ? ", signaled" : ", not signaled") : "");
+                    if (o && o->type == KOBJ_THREAD) LOG("%s     = guest thread %llu\n", prefix, (unsigned long long)((KThread *)o)->id);
+                    if (h == vi_vsync_handle()) LOG("%s     = the display's vsync event\n", prefix);
+                }
+            if (t->wait_kind == WAIT_CONDVAR) {  // who signalled this condition variable last
+                unsigned j = (unsigned)((t->wait_addr >> 2) ^ (t->wait_addr >> 13)) % SIGTAB;
+                if (sigtab[j].key == t->wait_addr)
+                    LOG("%s   last signalled by guest thread %llu %llu ms ago (count %d, woke %d); key word %x\n", prefix,
+                        (unsigned long long)sigtab[j].by, (unsigned long long)((plat_now_ns() - sigtab[j].ns) / 1000000),
+                        sigtab[j].count, sigtab[j].woken, *(volatile uint32_t *)(uintptr_t)t->wait_addr);
+                else LOG("%s   never signalled (or its slot reused); key word %x\n", prefix,
+                         *(volatile uint32_t *)(uintptr_t)t->wait_addr);
+            }
+            if (t->wait_kind == WAIT_CONDVAR || t->wait_kind == WAIT_MUTEX)  // the mutex: who holds it
+                LOG("%s   mutex %llx word %x\n", prefix, (unsigned long long)(t->wait_kind == WAIT_CONDVAR ? t->wait_mutex : t->wait_addr),
+                    *(volatile uint32_t *)(uintptr_t)(t->wait_kind == WAIT_CONDVAR ? t->wait_mutex : t->wait_addr));
         }
+    {   // the latest CancelSynchronization calls
+        int n = 0;
+        for (unsigned k = 0; k < SIGLOG && k < nsiglog && n < 6; k++) {
+            unsigned i = (nsiglog - 1 - k) % SIGLOG;
+            if (!siglog[i].cancel) continue;
+            n++;
+            LOG("%s CancelSynchronization of guest thread %llu by %llu %llu ms ago (target %s)\n", prefix,
+                (unsigned long long)siglog[i].key, (unsigned long long)siglog[i].by,
+                (unsigned long long)((plat_now_ns() - siglog[i].ns) / 1000000), siglog[i].woken ? "in WaitSynchronization" : "not waiting");
+        }
+    }
     if (locked) pthread_mutex_unlock(&g_klock);
 }
 

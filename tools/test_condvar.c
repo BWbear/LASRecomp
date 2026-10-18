@@ -80,7 +80,21 @@ int main(void) {
         pthread_join(signaler, NULL);
         mutex_release((uint64_t)&mutex_word);
     }
+    {   // A pending CancelSynchronization is for WaitSynchronization only: a condition variable wait and a polling
+        // WaitSynchronization (timeout 0) leave it, the next blocking WaitSynchronization returns cancelled.
+        KObject *ev = calloc(1, sizeof *ev);
+        ev->type = KOBJ_EVENT;
+        uint32_t h = kernel_new_handle(ev);
+        int32_t idx = -1;
+        waiter.cancel = true;
+        mutex_word = waiter.handle;
+        uint32_t r = svc_wait_process_wide_key((uint64_t)&mutex_word, (uint64_t)&condition_word, waiter.handle, 1000000);
+        assert(r == R_TIMEOUT && waiter.cancel);
+        assert(svc_wait_synchronization((uint64_t)&h, 1, 0, &idx) == R_TIMEOUT && waiter.cancel);
+        assert(svc_wait_synchronization((uint64_t)&h, 1, -1, &idx) == R_CANCELLED && !waiter.cancel);
+    }
     pthread_cond_destroy(&waiter.cond);
-    puts("PASS: timeout returns unlocked; repeated SDK reacquire; signal returns owned; contended ownership transfer");
+    puts("PASS: timeout returns unlocked; repeated SDK reacquire; signal returns owned; contended ownership transfer; "
+         "cancel kept for WaitSynchronization");
     return 0;
 }
